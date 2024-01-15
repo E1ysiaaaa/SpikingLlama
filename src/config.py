@@ -266,7 +266,7 @@ tiny_LLaMA = [
     dict(
         org="StatNLP-research",
         name="tiny_LLaMA_120M",
-        block_size=2048,
+        block_size=512,
         vocab_size=32000,
         padding_multiple=64,
         n_layer=12,

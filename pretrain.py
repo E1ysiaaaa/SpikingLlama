@@ -29,7 +29,7 @@ out_dir = Path("out") / name
 
 # Hyperparameters
 num_of_devices = 8
-global_batch_size = 512
+global_batch_size = 128
 learning_rate = 4e-4
 micro_batch_size = 8
 max_step = 20000 * 2
@@ -140,9 +140,11 @@ def main(fabric, train_data_dir, val_data_dir, resume):
 
     if resume is True:
         resume = sorted(out_dir.glob("*.pth"))[-1]
+        state = {"model": model, "hparams": hparams, "iter_num": 0, "step_count": 0}
     if resume :
         fabric.print(f"Resuming training from {resume}")
-        fabric.load(resume, state)
+        fabric.load(resume, state, strict=False)
+        state['optimizer'] = optimizer
 
     train_time = time.perf_counter()
     train(fabric, state, train_dataloader, val_dataloader, monitor, resume)
