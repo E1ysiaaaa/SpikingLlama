@@ -46,7 +46,7 @@ def act_quantization(b):
 class QuantReLU(nn.ReLU):
     def __init__(self):
         super().__init__()
-        self.bit = 8
+        self.bit = 6
         self.act_alq = act_quantization(self.bit)
         self.act_alpha = torch.nn.Parameter(torch.tensor(8.0))
 

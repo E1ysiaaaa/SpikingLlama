@@ -19,12 +19,15 @@ KVCache = Tuple[torch.Tensor, torch.Tensor]
 import math
 from typing import Optional, Tuple
 from einops import repeat
+from time import sleep
+from IFNeuron import IF
 
-T_total = 63
+T_total = 255
 time_step = T_total
 wait_time = T_total
 
-class IF(nn.Module):
+#'''
+class torchIF(nn.Module):
     SOP = 0
     def __init__(self, T=T_total, step=time_step):
         super().__init__()
@@ -49,6 +52,7 @@ class IF(nn.Module):
         
         IF.SOP += spikes.sum().item()
         return threshold * spikes
+#'''
 
 class SpikeInnerProduct(nn.Module):
     SOP = 0
@@ -59,8 +63,8 @@ class SpikeInnerProduct(nn.Module):
 
     def forward(self, x, y):
         T, B, n_heads, S, head_dim = x.shape
-        x_th = torch.max(x.flatten()).item().to(x.device)
-        y_th = torch.max(y.flatten()).item().to(y.device)
+        x_th = torch.max(x.flatten()).item()
+        y_th = torch.max(y.flatten()).item()
         out_weight = torch.zeros([T, B, n_heads, S, S]).to(x.device)
         
         for i in range(0, self.T, self.step):
@@ -70,13 +74,25 @@ class SpikeInnerProduct(nn.Module):
                 x_add = x_add + x[i+j] / self.step
                 y_add = y_add + y[i+j] / self.step
             weight = x_add @ y_add
-            SOP += weight.sum().item() * (self.step * self.step / x_th / y_th)
+            SpikeInnerProduct.SOP += weight.sum().item() * (self.step * self.step / x_th / y_th)
             for j in range(min(self.step, self.T - i)):
                 out_weight[i+j] = weight
         return out_weight
 
+class WaitLayerNorm(nn.LayerNorm):
+    def __init__(self, dim, T=T_total):
+        super().__init__(dim)
+        self.T = T
+
+    def forward(self, x):
+        T, B, S, D = x.shape
+        out = x.mean(dim=0)
+        out = super().forward(out)
+        out = repeat(out, 'b s d -> t b s d', t=T)
+        return out
+
 class SpikeGPT(nn.Module):
-    def __init__(self, config: Config, T=T_toal) -> None:
+    def __init__(self, config: Config, T=T_total) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
@@ -84,12 +100,12 @@ class SpikeGPT(nn.Module):
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
         self.poe = nn.Parameter(torch.zeros([config.block_size, config.n_embd]))
-        self.out_if = IF()
+        self.out_if = IF(step=time_step)
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
                 h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+                ln_f=WaitLayerNorm(config.n_embd, T_total),
             )
         )
         self.mask_cache: Optional[torch.Tensor] = None
@@ -121,7 +137,7 @@ class SpikeGPT(nn.Module):
     def forward(
         self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
-        T, B, S = idx.size()
+        B, S = idx.size()
         use_kv_cache = input_pos is not None
 
         block_size = self.config.block_size
@@ -146,9 +162,10 @@ class SpikeGPT(nn.Module):
         else:
             mask = None
         
-        # forward the model itself
+        # forward the model itsel
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
         x = x + self.poe[:S, :].unsqueeze(0)
+        x = repeat(x, "b s d -> t b s d", t=self.T)
             
         if not use_kv_cache:
             for block in self.transformer.h:
@@ -188,12 +205,12 @@ class SpikeGPT(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.act_1 = IF()
+        self.norm_1 = WaitLayerNorm(config.n_embd, T_total)
+        self.act_1 = IF(step=time_step)
         self.attn = CausalSelfAttention(config)
         if not config.shared_attention_norm:
-            self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
-            self.act_2 = IF()
+            self.norm_2 = WaitLayerNorm(config.n_embd, T_total)
+            self.act_2 = IF(step=time_step)
         self.mlp = config.mlp_class(config)
         self.config = config
 
@@ -230,10 +247,9 @@ class CausalSelfAttention(nn.Module):
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
-        self.act_1 = IF()
-        self.act_2 = IF()
-        self.inner_product1 = SpikeInnerProduct()
-        self.inner_product2 = SpikeInnerProduct()
+        self.act_1 = IF(step=time_step)
+        self.act_2 = torchIF()
+        self.inner_product = SpikeInnerProduct()
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
@@ -247,9 +263,9 @@ class CausalSelfAttention(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
-        T, B, S, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        qkv = self.act_1(self.attn(x))
+        T, B, S, C = x.shape  # batch size, sequence length, embedding dimensionality (n_embd)
+        x = self.attn(x)
+        qkv = self.act_1(x)
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
@@ -329,12 +345,13 @@ class CausalSelfAttention(nn.Module):
                 mask.masked_fill_(mask.logical_not(), float("-inf"))
             else:
                 attn_bias += mask
-        attn_weight = self.inner_product1(q, k.transpose(-2, -1)) * scale_factor
+
+        attn_weight = self.inner_product(q, k.transpose(-2, -1)) * scale_factor
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
         #attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
         attn_weight = self.act_2(attn_weight)
-        y = self.inner_product2(attn_weight, v)
+        y = attn_weight @ v
         return y.transpose(1, 2)
 
 
@@ -343,7 +360,7 @@ class GptNeoxMLP(nn.Module):
         super().__init__()
         self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
-        self.act = IF()
+        self.act = IF(step=time_step)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.fc(x)

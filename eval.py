@@ -1,4 +1,5 @@
 from src.model import GPT
+from src.spike_model import SpikeGPT, IF, SpikeInnerProduct
 from src.config import Config
 from src.tokenizer import Tokenizer
 from inference import generate, sample_top_p
@@ -17,7 +18,7 @@ def lambada(model, tokenizer):
 
     temperature = 0.6
     top_p = 0.9
-    total_count = 100
+    total_count = 10
     acc = 0
     ce = 0
     small_set = dataset[:total_count]['text']
@@ -27,7 +28,7 @@ def lambada(model, tokenizer):
     with torch.no_grad():
         for i in tqdm(range(total_count)):
             tokens = tokenizer.encode(small_set[i])
-            input_token = tokens[:-2].to("cuda")
+            input_token = torch.tensor(tokens[:-2], device="cuda")
             answer = tokens[-2].item()
             cur_pos = input_token.shape[0]
             pred = model.forward(input_token.unsqueeze(0), cur_pos)
@@ -41,6 +42,26 @@ def lambada(model, tokenizer):
     print(f"lambada accuracy: {acc}, ppl: {math.exp(ce)}")
     
 def wikitext2(model, tokenizer):
+    dataset = load_dataset("wikitext")
+    dataset = dataset['wikitext-2-v1']
+
+    temperature = 0.6
+    top_p = 0.9
+    total_count = 100
+    ce = 0
+    small_set = dataset[:total_count]
+    loss_fn = torch.nn.CrossEntropyLoss()
+
+    model.eval()
+    with torch.no_grad():
+        for i in tqdm(range(total_count)):
+            tokens = tokenizer.encode(small_set[i]).to("cuda")
+            input_token = tokens[:-2]
+            pred = model.forward(input_token.unsqueeze(0))
+            ce += loss_fn(pred[0], torch.tensor(tokens[1: -1], device="cuda", dtype=torch.long))
+
+    ce = ce / total_count
+    print(f"wikitext2 ppl: {ce}")
 
 def main(task: str):
     model_name = "tiny_LLaMA_120M"
@@ -48,7 +69,7 @@ def main(task: str):
     tokenizer_path = Path("checkpoints/")
     tokenizer = Tokenizer(tokenizer_path)
     config = Config.from_name(model_name)
-    model = GPT(config).to("cuda")
+    model = SpikeGPT(config).to("cuda")
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint['model'], strict=False)
 
