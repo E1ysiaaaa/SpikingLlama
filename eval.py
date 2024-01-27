@@ -39,7 +39,7 @@ def lambada(model, tokenizer):
                 acc += 1
     acc = 1.0 * acc / total_count
     ce = ce / total_count
-    print(f"lambada accuracy: {acc}, ppl: {math.exp(ce)}")
+    print(f"lambada accuracy: {acc}, ppl: {math.exp(ce)}, SOP: {(IF.SOP + SpikeInnerProduct.SOP) / total_count}")
     
 def wikitext2(model, tokenizer):
     dataset = load_dataset("wikitext")

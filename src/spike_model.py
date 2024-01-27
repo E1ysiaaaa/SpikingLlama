@@ -1,4 +1,4 @@
-"""Full definition of a GPT NeoX Language Model, all of it in this single file.
+""""Full definition of a GPT NeoX Language Model, all of it in this single file.
 
 Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT and
 https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
@@ -20,14 +20,14 @@ import math
 from typing import Optional, Tuple
 from einops import repeat
 from time import sleep
-from IFNeuron import IF
+#from IFNeuron import IF
 
-T_total = 255
+T_total = 63
 time_step = T_total
 wait_time = T_total
 
 #'''
-class torchIF(nn.Module):
+class IF(nn.Module):
     SOP = 0
     def __init__(self, T=T_total, step=time_step):
         super().__init__()
@@ -79,6 +79,7 @@ class SpikeInnerProduct(nn.Module):
                 out_weight[i+j] = weight
         return out_weight
 
+#'''
 class WaitLayerNorm(nn.LayerNorm):
     def __init__(self, dim, T=T_total):
         super().__init__(dim)
@@ -90,6 +91,7 @@ class WaitLayerNorm(nn.LayerNorm):
         out = super().forward(out)
         out = repeat(out, 'b s d -> t b s d', t=T)
         return out
+#'''
 
 class SpikeGPT(nn.Module):
     def __init__(self, config: Config, T=T_total) -> None:
@@ -145,7 +147,7 @@ class SpikeGPT(nn.Module):
             max_seq_length = block_size
         if use_kv_cache:  # not relevant otherwise
             assert (
-                max_seq_length >= S
+               max_seq_length >= S
             ), f"Cannot forward sequence of length {T}, max seq length is only {max_seq_length}"
         assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
         assert block_size >= S, f"Cannot forward sequence of length {T}, block size is only {block_size}"
@@ -157,7 +159,7 @@ class SpikeGPT(nn.Module):
             self.mask_cache = self.build_mask_cache(idx)
 
         if use_kv_cache:
-            mask = self.mask_cache.index_select(2, input_pos)
+            mask = self.mask_cache.index_select(3, input_pos)
             mask = mask[:, :, :, :, :max_seq_length]
         else:
             mask = None
@@ -174,12 +176,12 @@ class SpikeGPT(nn.Module):
             self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length)
             for i, block in enumerate(self.transformer.h):
                 x, self.kv_caches[i] = block(x, max_seq_length, mask, input_pos, self.kv_caches[i])
-
+        
         x = self.transformer.ln_f(x)
         x = self.out_if(x)
-        x = x.mean(dim=0)
 
         x = self.lm_head(x)  # (b, t, vocab_size)
+        x = x.mean(dim=0)
         return x
 
     @classmethod
@@ -222,12 +224,16 @@ class Block(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
-
+        T, B, S, D = x.shape
         n_1 = self.norm_1(x)
         n_1 = self.act_1(n_1)
         h, new_kv_cache = self.attn(n_1, max_seq_length, mask, input_pos, kv_cache)
         if self.config.parallel_residual:
-            n_2 = n_1 if self.config.shared_attention_norm else self.act_2(self.norm_2(x))
+            if self.config.shared_attention_norm:
+                n_2 = n_1
+            else:
+                n_2 = self.norm_2(x)
+                n_2 = self.act_2(n_2)
             x = x + h + self.mlp(n_2)
         else:
             if self.config.shared_attention_norm:
@@ -248,7 +254,7 @@ class CausalSelfAttention(nn.Module):
         # key, query, value projections for all heads, but in a batch
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
         self.act_1 = IF(step=time_step)
-        self.act_2 = torchIF()
+        self.act_2 = IF(step=time_step)
         self.inner_product = SpikeInnerProduct()
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -352,7 +358,7 @@ class CausalSelfAttention(nn.Module):
         #attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
         attn_weight = self.act_2(attn_weight)
         y = attn_weight @ v
-        return y.transpose(1, 2)
+        return y.transpose(3, 2)
 
 
 class GptNeoxMLP(nn.Module):
