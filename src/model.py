@@ -265,7 +265,7 @@ class CausalSelfAttention(nn.Module):
 
         y = self.scaled_dot_product_attention(q, k, v, mask=mask)
 
-        y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
+        y = y.reshape(B, T, C)  # re-assemble all head outputs side by sid
 
         # output projection
         y = self.proj(y)
@@ -311,7 +311,7 @@ class CausalSelfAttention(nn.Module):
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
         #attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-        attn_weight = self.act_2(attn_weight)
+        #attn_weight = self.act_2(attn_weight)
         y = attn_weight @ v
         return y.transpose(1, 2)
 

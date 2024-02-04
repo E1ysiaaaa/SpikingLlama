@@ -42,26 +42,30 @@ def lambada(model, tokenizer):
     print(f"lambada accuracy: {acc}, ppl: {math.exp(ce)}, SOP: {(IF.SOP + SpikeInnerProduct.SOP) / total_count}")
     
 def wikitext2(model, tokenizer):
-    dataset = load_dataset("wikitext")
-    dataset = dataset['wikitext-2-v1']
+    dataset = load_dataset("wikitext", "wikitext-2-v1")
+    dataset = dataset["test"]["text"]
 
     temperature = 0.6
     top_p = 0.9
-    total_count = 100
+    total_count = 10
     ce = 0
-    small_set = dataset[:total_count]
     loss_fn = torch.nn.CrossEntropyLoss()
 
     model.eval()
+    shift = 0
     with torch.no_grad():
         for i in tqdm(range(total_count)):
-            tokens = tokenizer.encode(small_set[i]).to("cuda")
+            if dataset[i+shift] == '':
+                shift += 1
+                continue
+            else:
+                tokens = tokenizer.encode(dataset[i+shift]).to("cuda")
             input_token = tokens[:-2]
             pred = model.forward(input_token.unsqueeze(0))
             ce += loss_fn(pred[0], torch.tensor(tokens[1: -1], device="cuda", dtype=torch.long))
 
     ce = ce / total_count
-    print(f"wikitext2 ppl: {ce}")
+    print(f"wikitext2 ppl: {math.exp(ce)}")
 
 def main(task: str):
     model_name = "tiny_LLaMA_120M"
@@ -71,10 +75,12 @@ def main(task: str):
     config = Config.from_name(model_name)
     model = SpikeGPT(config).to("cuda")
     checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint['model'], strict=False)
+    model.load_state_dict(checkpoint['model'], strict=True)
 
     if task == "lambada":
         lambada(model, tokenizer)
+    elif task == "wikitext2":
+        wikitext2(model, tokenizer)
 
 if __name__ == "__main__":
     from jsonargparse import CLI

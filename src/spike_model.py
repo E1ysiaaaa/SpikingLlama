@@ -22,7 +22,7 @@ from einops import repeat
 from time import sleep
 #from IFNeuron import IF
 
-T_total = 63
+T_total = 15
 time_step = T_total
 wait_time = T_total
 
@@ -31,20 +31,21 @@ class IF(nn.Module):
     SOP = 0
     def __init__(self, T=T_total, step=time_step):
         super().__init__()
-        self.alpha = torch.nn.Parameter(torch.tensor(8.0))
+        self.act_alpha = torch.nn.Parameter(torch.tensor(8.0))
         self.T = T
         self.step = step
 
     def forward(self, x):
         # x [T, B, S, D]
         device = torch.cuda.current_device()
-        threshold = self.alpha
+        threshold = self.act_alpha
         membrane = 0.5 * threshold
+        #membrane = 0
         spikes = torch.zeros(x.shape).to(device)
 
         for i in range(0, self.T, self.step):
-            for j in range(0, min(self.step, self.T - i)):
-                membrane = membrane + x[i+j]
+            shift = min(self.step, self.T - i)
+            membrane = membrane + x[i: i+shift].sum(dim=0)
             for j in range(0, min(self.step, self.T - i)):
                 spike = membrane > threshold
                 membrane[spike] = membrane[spike] - threshold
@@ -68,15 +69,12 @@ class SpikeInnerProduct(nn.Module):
         out_weight = torch.zeros([T, B, n_heads, S, S]).to(x.device)
         
         for i in range(0, self.T, self.step):
-            x_add = 0
-            y_add = 0
-            for j in range(min(self.step, self.T - i)):
-                x_add = x_add + x[i+j] / self.step
-                y_add = y_add + y[i+j] / self.step
+            shift = min(self.step, self.T - i)
+            x_add = x[i: i+shift].sum(dim=0) / self.step
+            y_add = y[i: i+shift].sum(dim=0) / self.step
             weight = x_add @ y_add
             SpikeInnerProduct.SOP += weight.sum().item() * (self.step * self.step / x_th / y_th)
-            for j in range(min(self.step, self.T - i)):
-                out_weight[i+j] = weight
+            out_weight[i: i+shift] = repeat(weight, "a b c d -> t a b c d", t=shift)
         return out_weight
 
 #'''
@@ -213,7 +211,7 @@ class Block(nn.Module):
         if not config.shared_attention_norm:
             self.norm_2 = WaitLayerNorm(config.n_embd, T_total)
             self.act_2 = IF(step=time_step)
-        self.mlp = config.mlp_class(config)
+        self.mlp = GptNeoxMLP(config)
         self.config = config
 
     def forward(
@@ -306,10 +304,10 @@ class CausalSelfAttention(nn.Module):
             k = cache_k.index_copy_(2, input_pos, k)
             v = cache_v.index_copy_(2, input_pos, v)
             kv_cache = k, v
-
+        
         y = self.scaled_dot_product_attention(q, k, v, mask=mask)
 
-        y = y.reshape(T, B, S, C)  # re-assemble all head outputs side by side
+        y = y.reshape(T, B, S, -1)  # re-assemble all head outputs side by sid
 
         # output projection
         y = self.proj(y)
@@ -356,7 +354,7 @@ class CausalSelfAttention(nn.Module):
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
         #attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-        attn_weight = self.act_2(attn_weight)
+        #attn_weight = self.act_2(attn_weight)
         y = attn_weight @ v
         return y.transpose(3, 2)
 
