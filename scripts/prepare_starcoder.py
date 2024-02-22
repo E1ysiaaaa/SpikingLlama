@@ -67,9 +67,9 @@ def prepare_full(
 
 
 def prepare(
-    source_path: Path = Path("data/RedPajama-Data-1T-Sample"),
-    tokenizer_path: Path = Path("checkpoints/lit-llama/tokenizer.model"),
-    destination_path: Path = Path("data/red_pajama_sample"),
+    source_path: Path = Path("data/starcoderdata"),
+    tokenizer_path: Path = Path("checkpoints/"),
+    destination_path: Path = Path("data/slim_star_combined"),
     chunk_size: int = 2049 * 1024,
     split: str="train",
     percentage: float = 1.0,

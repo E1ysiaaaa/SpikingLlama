@@ -61,8 +61,8 @@ def prepare_full(
         with zstd.open(open(filepath, "rb"), "rt", encoding="utf-8") as f:
             for row in tqdm(f):
                 text = json.loads(row)["text"]
-                if json.loads(row)["meta"]["redpajama_set_name"] == "RedPajamaGithub":
-                    continue # we don't want to include the github data
+                #if json.loads(row)["meta"]["redpajama_set_name"] == "RedPajamaGithub":
+                #    continue # we don't want to include the github data
                 text_ids = tokenizer.encode(text)
                 builder.add_array(np.array(text_ids, dtype=builder.dtype))
 
@@ -71,9 +71,9 @@ def prepare_full(
 
 
 def prepare(
-    source_path: Path = Path("data/RedPajama-Data-1T-Sample"),
-    tokenizer_path: Path = Path("checkpoints/lit-llama/tokenizer.model"),
-    destination_path: Path = Path("data/red_pajama_sample"),
+    source_path: Path = Path("data/SlimPajama-627B"),
+    tokenizer_path: Path = Path("checkpoints/"),
+    destination_path: Path = Path("data/slim_star_combined"),
     chunk_size: int = 2049 * 1024,
     split: str="train",
     percentage: float = 1.0,
