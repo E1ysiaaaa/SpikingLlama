@@ -16,7 +16,6 @@ from src.config import Config
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 #FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
 
-@torch.no_gard()
 def act_quantization(b):
     def uniform_quant(x, b):
         xdiv = x.mul(2 ** b - 1)
@@ -44,9 +43,8 @@ def act_quantization(b):
 
     return _uq().apply
 
-@torch.no_gard()
 class QuantReLU(nn.ReLU):
-    def __init__(self, bit=32):
+    def __init__(self, bit=4):
         super().__init__()
         self.bit = bit
         self.act_alq = act_quantization(self.bit)
@@ -59,8 +57,19 @@ class QuantReLU(nn.ReLU):
         else:
             return x.clamp(min=0, max=self.act_alpha.item())
 
-@torch.no_gard()
-class GPT(nn.Module):
+class AutoEncoder(nn.Module):
+    def __init__(self, in_size, out_size):
+        self.linear1 = nn.Linear(in_size, in_size * 4)
+        self.linear2 = nn.Linear(in_size * 4, out_size)
+        self.act1 = nn.ReLU()
+        self.act2 = QuantReLU()
+
+    def forward(self, x):
+        out = self.act1(self.linear1(x))
+        out = self.act2(self.linear2(out))
+        return out
+
+class QuantGPT(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
@@ -147,9 +156,6 @@ class GPT(nn.Module):
 
         x = self.lm_head(x)  # (b, t, vocab_size)
         return x
-   
-    def get_pairs(self):
-        return self.transformer.h[0].pairs
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -171,7 +177,6 @@ class GPT(nn.Module):
             for _ in range(self.config.n_layer)
         ]
 
-@torch.no_gard()
 class Block(nn.Module):
     def __init__(self, config: Config, idx=0) -> None:
         super().__init__()
@@ -184,7 +189,6 @@ class Block(nn.Module):
             self.act_2 = QuantReLU()
         self.mlp = config.mlp_class(config, self.idx)
         self.config = config
-        self.pairs = []
 
     def forward(
         self,
@@ -198,7 +202,6 @@ class Block(nn.Module):
         n_1 = self.norm_1(x)
         n_1 = self.act_1(n_1)
         h, new_kv_cache = self.attn(n_1, max_seq_length, mask, input_pos, kv_cache)
-        
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.act_2(self.norm_2(x))
             x = x + h + self.mlp(n_2)
@@ -211,19 +214,18 @@ class Block(nn.Module):
             
             x = x + h
             x = x + self.mlp(self.act_2(self.norm_2(x)))
-        if self.idx == 0:
-            self.pairs = self.pairs + self.attn.pairs + self.mlp.pairs
         return x, new_kv_cache
 
-        
-@torch.no_gard()
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, config: Config, idx=0) -> None:
         super().__init__()
-        self.idx = idx
-        self.pairs = []
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
+        self.idx = idx
+        if self.idx == 0:
+            self.encoder1 = AutoEncoder(config.n_embd, shape)
+            self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
         self.act_1 = QuantReLU()
         self.act_2 = QuantReLU()
@@ -241,11 +243,10 @@ class CausalSelfAttention(nn.Module):
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
-
-        w = self.attn(x)
+        
         if self.idx == 0:
-            self.pairs.append([x, w])
-        qkv = self.act_1(w)
+            x = self.encoder1(x)
+        qkv = self.act_1(self.attn(x))
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
@@ -286,12 +287,11 @@ class CausalSelfAttention(nn.Module):
         y = y.reshape(B, T, C)  # re-assemble all head outputs side by sid
 
         # output projection
-
-        out = self.proj(y)
         if self.idx == 0:
-            self.pairs.append([y, out])
+            y = self.encoder2(y)
+        y = self.proj(y)
 
-        return out, kv_cache
+        return y, kv_cache
 
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -336,27 +336,28 @@ class CausalSelfAttention(nn.Module):
         y = attn_weight @ v
         return y.transpose(1, 2)
 
-@torch.no_gard()
+
 class GptNeoxMLP(nn.Module):
     def __init__(self, config: Config, idx=0) -> None:
         super().__init__()
         self.idx = idx
-        self.pairs = []
+        if self.idx == 0:
+            self.encoder1 = AutoEncoder(config.n_embd, config.intermediate_size)
+            self.encoder2 = AutoEncoder(config.intermediate_size, config.n_embd)
         self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         self.act = QuantReLU()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        w = self.fc(x)
         if self.idx == 0:
-            self.pairs.append([x, w])
-        x = self.act(w)
-        out = self.proj(x)
+            x = self.encoder1(x)
+        x = self.fc(x)
         if self.idx == 0:
-            self.pairs.append([x, out])
-        return out
+            x = self.encoder2(x)
+        x = self.act(x)
+        return self.proj(x)
 
-@torch.no_gard()
+
 class LLaMAMLP(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
@@ -370,4 +371,5 @@ class LLaMAMLP(nn.Module):
         # x = torch.nn.functional.silu(x_fc_1) * x_fc_2
         # return self.proj(x)
         return self.swiglu(x)
+
 

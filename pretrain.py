@@ -15,6 +15,7 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 # from apex.optimizers import FusedAdam #torch optimizer has a cuda backend, which is faster actually
 from src.model import GPT, Block, Config, CausalSelfAttention
+from src.quant_model import QuantGPT
 from src.packed_dataset import CombinedDataset, PackedDataset
 from src.speed_monitor import SpeedMonitorFabric as Monitor
 from src.speed_monitor import estimate_flops, measure_flops
@@ -120,7 +121,7 @@ def main(fabric, train_data_dir, val_data_dir, resume):
     fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.perf_counter()
     with fabric.init_module(empty_init=False):
-        model = GPT(config)
+        model = QuantGPT(config)
         model.apply(partial(model._init_weights ,n_layer=config.n_layer))
  
 
@@ -155,6 +156,10 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
     model = state["model"]
     optimizer = state["optimizer"]
 
+    config = Config.from_name(model_name)
+    teacher_model = GPT(config)
+    # TODO: load teacher model's weight
+
     if val_dataloader is not None:
         validate(fabric, model, val_dataloader)  # sanity check
 
@@ -184,6 +189,7 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
     curr_iter = 0
             
     loss_func = FusedCrossEntropyLoss()
+    act_loss_func = torch.nn.MSELoss()
     for  train_data in train_dataloader:
         # resume loader state. This is not elegant but it works. Should rewrite it in the future.
         if resume:
@@ -208,9 +214,20 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
         input_ids = train_data[:, 0 : model.config.block_size].contiguous()
         targets = train_data[:, 1 : model.config.block_size + 1].contiguous()
         is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
+        mu = 0.7
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
-            loss = loss_func(logits, targets)
+            with torch.no_grad():
+                _ = teacher_model(input_ids)
+            pairs = teacher_model.get_pairs()
+            fb_attn = model.transformer.h[0].attn
+            fb_mlp = model.transformer.h[0].mlp
+            loss1 = act_loss_func(fb_attn.attn(fb_attn.encoder1(pairs[0][0])), pairs[0][1])
+            loss1 = loss1 + act_loss_func(fb_attn.proj(fb_attn.encoder2(pairs[1][0])), pairs[1][1])
+            loss1 = loss1 + act_loss_func(fb_mlp.fc(fb_mlp.encoder1(pairs[2][0])), pairs[2][1])
+            loss1 = loss1 + act_loss_func(fb_mlp.proj(fb_mlp.encoder2(pairs[3][0])), pairs[3][1])
+            #logits = model(input_ids)
+            loss2 = loss_func(logits, targets)
+            loss = mu * loss1 + (1 - mu) * loss2
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)
 
