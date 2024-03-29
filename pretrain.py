@@ -28,10 +28,11 @@ name = "spiking-llama-120m"
 out_dir = Path("out") / name
 
 # Hyperparameters
-num_of_devices = 8
-global_batch_size = 128
+GPU_NUM = 7
+num_of_devices = GPU_NUM
+global_batch_size = GPU_NUM * GPU_NUM * 2
 learning_rate = 4e-4
-micro_batch_size = 8
+micro_batch_size = GPU_NUM
 max_step = 40000 * 2
 warmup_steps = 2000
 log_step_interval = 10
@@ -65,7 +66,7 @@ wandb_logger = WandbLogger()
 
 
 def setup(
-    devices: int = 8,
+    devices: int = GPU_NUM,
     train_data_dir: Path = Path("data/redpajama_sample"),
     val_data_dir: Optional[Path] = None,
     precision: Optional[str] = None,
