@@ -22,7 +22,7 @@ from einops import repeat
 from time import sleep
 #from IFNeuron import IF
 
-T_total = 15
+T_total = 3
 time_step = T_total
 wait_time = T_total
 

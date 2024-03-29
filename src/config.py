@@ -248,7 +248,7 @@ tiny_LLaMA = [
     dict(
         org="StatNLP-research",
         name="tiny_LLaMA_1b",
-        block_size=2048,
+        block_size=1024,
         vocab_size=32000,
         padding_multiple=64,
         n_layer=22,
@@ -257,10 +257,7 @@ tiny_LLaMA = [
         rotary_percentage=1.0,
         parallel_residual=False,
         bias=False,
-        _norm_class="FusedRMSNorm",
         norm_eps=1e-5, #Llama 2 use 1e-5. Llama 1 use 1e-6
-        _mlp_class="LLaMAMLP",
-        intermediate_size=5632,
         n_query_groups=4,
     ),
     dict(

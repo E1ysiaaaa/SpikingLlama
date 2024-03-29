@@ -1,6 +1,7 @@
 from src.model import GPT
 from src.config import Config
 from src.tokenizer import Tokenizer
+from src.spike_model import SpikeGPT, IF, SpikeInnerProduct
 
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple, TypedDict
@@ -141,21 +142,22 @@ def sample_top_p(probs, p):
 
 def main():
     model_name = "tiny_LLaMA_120M"
-    checkpoint_path = "out/spiking-llama-120m/iter-075000-ckpt.pth"
+    checkpoint_path = "out/spiking-llama-120m/iter-980000-ckpt.pth"
     tokenizer_path = Path("checkpoints/")
     tokenizer = Tokenizer(tokenizer_path)
     config = Config.from_name(model_name)
-    model = GPT(config).to("cuda")
+    model = SpikeGPT(config).to("cuda")
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint['model'], strict=False)
 
-    input_text = "As with previous <unk> Chronicles games , Valkyria Chronicles III is a tactical role @-@ playing game where players take control of a military unit and take part in missions against enemy forces . Stories are told through comic book @-@ like panels with animated character portraits , with characters speaking partially through voiced speech bubbles and partially through <unk> text . The player progresses through a series of linear missions , gradually unlocked as maps that can be freely <unk> through and replayed as they are unlocked . The route to each story location on the map varies depending on an individual player 's approach : when one option is selected , the other is sealed off to the player . Outside missions , the player characters rest in a camp ,"
-    max_gen_len = 100
+    input_text = "It was a sunny day and I went to the forest to have some "
+    max_gen_len = 1
     input_tokens = tokenizer.encode(input_text)
     prompt_tokens = [input_tokens[:-1]]
     out_tokens, _ = generate(model, tokenizer, prompt_tokens, max_gen_len, echo=True)
     out_text = tokenizer.decode(torch.tensor(out_tokens[0]))
     print(out_text)
+    print(IF.SOP)
 
 if __name__ == "__main__":
     main()

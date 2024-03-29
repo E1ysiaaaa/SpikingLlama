@@ -28,11 +28,11 @@ name = "spiking-llama-120m"
 out_dir = Path("out") / name
 
 # Hyperparameters
-num_of_devices = 8
-global_batch_size = 128
+num_of_devices = 7
+global_batch_size = 343
 learning_rate = 4e-4
-micro_batch_size = 8
-max_step = 40000 * 2
+micro_batch_size = 7
+max_step = 140000 * 2
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
@@ -53,8 +53,6 @@ assert gradient_accumulation_steps > 0
 warmup_iters = warmup_steps * gradient_accumulation_steps
 
 
-
-
 max_iters = max_step * gradient_accumulation_steps
 lr_decay_iters = max_iters
 log_iter_interval = log_step_interval * gradient_accumulation_steps
@@ -65,8 +63,8 @@ wandb_logger = WandbLogger()
 
 
 def setup(
-    devices: int = 8,
-    train_data_dir: Path = Path("data/redpajama_sample"),
+    devices: int = 7,
+    train_data_dir: Path = Path("data/slimpajama"),
     val_data_dir: Optional[Path] = None,
     precision: Optional[str] = None,
     tpu: bool = False,
@@ -316,8 +314,8 @@ def create_dataloaders(
     batch_size: int,
     block_size: int,
     fabric,
-    train_data_dir: Path = Path("data/bookcorpus"),
-    val_data_dir: Optional[Path] = Path("data/bookcorpus"),
+    train_data_dir: Path = Path("data/slimpajama"),
+    val_data_dir: Optional[Path] = Path("data/slimpajama"),
     seed: int = 12345,
 ) -> Tuple[DataLoader, DataLoader]:
     # Increase by one because we need the next word as well
