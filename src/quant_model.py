@@ -1,4 +1,4 @@
-""""Full definition of a GPT NeoX Language Model, all of it in this single file.
+"""Full definition of a GPT NeoX Language Model, all of it in this single file.
 
 Based on the nanoGPT implementation: https://github.com/karpathy/nanoGPT and
 https://github.com/EleutherAI/gpt-neox/tree/main/megatron/model.
@@ -16,96 +16,76 @@ from src.config import Config
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 #FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
 
-import math
-from typing import Optional, Tuple
-from einops import repeat
-from time import sleep
-#from IFNeuron import IF
+def act_quantization(b):
+    def uniform_quant(x, b):
+        xdiv = x.mul(2 ** b - 1)
+        xhard = xdiv.round().div(2 ** b - 1)
+        return xhard
+    
+    class _uq(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, alpha):
+            x = x.div(alpha)
+            x_c = x.clamp(min=0, max=1)
+            x_q = uniform_quant(x_c, b)
+            ctx.save_for_backward(x, x_q)
+            x_q = x_q.mul(alpha)
+            return x_q
 
-T_total = 3
-time_step = T_total
-wait_time = T_total
+        @staticmethod
+        def backward(ctx, grad_output):
+            grad_input = grad_output.clone()
+            x, x_q = ctx.saved_tensors
+            i = (x > 1).float()
+            grad_alpha = (grad_output * (i + (x_q - x) * (1 - i))).sum()
+            grad_input = grad_input * (1 - i)
+            return grad_input, grad_alpha
 
-#'''
-class IF(nn.Module):
-    SOP = 0
-    def __init__(self, T=T_total, step=time_step):
+    return _uq().apply
+
+class QuantReLU(nn.ReLU):
+    def __init__(self, bit=4):
         super().__init__()
+        self.bit = bit
+        self.act_alq = act_quantization(self.bit)
         self.act_alpha = torch.nn.Parameter(torch.tensor(8.0))
-        self.T = T
-        self.step = step
 
     def forward(self, x):
-        # x [T, B, S, D]
-        device = torch.cuda.current_device()
-        threshold = self.act_alpha
-        membrane = 0.5 * threshold
-        #membrane = 0
-        spikes = torch.zeros(x.shape).to(device)
+        x = F.relu(x)
+        if self.bit < 16:
+            return self.act_alq(x, self.act_alpha)
+        else:
+            return x.clamp(min=0, max=self.act_alpha.item())
 
-        for i in range(0, self.T, self.step):
-            shift = min(self.step, self.T - i)
-            membrane = membrane + x[i: i+shift].sum(dim=0)
-            for j in range(0, min(self.step, self.T - i)):
-                spike = membrane > threshold
-                membrane[spike] = membrane[spike] - threshold
-                spikes[i+j] = spike.float()
-        
-        IF.SOP += spikes.sum().item()
-        return threshold * spikes
-#'''
-
-class SpikeInnerProduct(nn.Module):
-    SOP = 0
-    def __init__(self, T=T_total, step=time_step):
+class AutoEncoder(nn.Module):
+    def __init__(self, in_size, out_size):
         super().__init__()
-        self.T = T
-        self.step = step
-
-    def forward(self, x, y):
-        T, B, n_heads, S, head_dim = x.shape
-        x_th = torch.max(x.flatten()).item()
-        y_th = torch.max(y.flatten()).item()
-        out_weight = torch.zeros([T, B, n_heads, S, S]).to(x.device)
-        
-        for i in range(0, self.T, self.step):
-            shift = min(self.step, self.T - i)
-            x_add = x[i: i+shift].sum(dim=0) / self.step
-            y_add = y[i: i+shift].sum(dim=0) / self.step
-            weight = x_add @ y_add
-            SpikeInnerProduct.SOP += weight.sum().item() * (self.step * self.step / x_th / y_th)
-            out_weight[i: i+shift] = repeat(weight, "a b c d -> t a b c d", t=shift)
-        return out_weight
-
-#'''
-class WaitLayerNorm(nn.LayerNorm):
-    def __init__(self, dim, T=T_total):
-        super().__init__(dim)
-        self.T = T
+        self.in_size = in_size
+        self.out_size = out_size
+        self.linear1 = nn.Linear(self.in_size, self.in_size // 2, bias=False)
+        self.linear2 = nn.Linear(self.in_size // 2, self.out_size, bias=False)
+        self.act1 = nn.ReLU()
+        self.act2 = QuantReLU()
 
     def forward(self, x):
-        T, B, S, D = x.shape
-        out = x.mean(dim=0)
-        out = super().forward(out)
-        out = repeat(out, 'b s d -> t b s d', t=T)
+        out = self.act1(self.linear1(x))
+        out = self.act2(self.linear2(out))
         return out
-#'''
 
-class SpikeGPT(nn.Module):
-    def __init__(self, config: Config, T=T_total) -> None:
+class QuantGPT(nn.Module):
+    def __init__(self, config: Config) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
-        self.T = T
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
         self.poe = nn.Parameter(torch.zeros([config.block_size, config.n_embd]))
-        self.out_if = IF(step=time_step)
+        self.out_if = QuantReLU()
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-                ln_f=WaitLayerNorm(config.n_embd, T_total),
+                h=nn.ModuleList(Block(config, i) for i in range(config.n_layer)),
+                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
         self.mask_cache: Optional[torch.Tensor] = None
@@ -135,9 +115,10 @@ class SpikeGPT(nn.Module):
             self.mask_cache = None
 
     def forward(
-        self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        B, S = idx.size()
+        self, idx, pairs = None, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
+    ):
+        # pack = (idx, pairs)
+        B, T = idx.size()
         use_kv_cache = input_pos is not None
 
         block_size = self.config.block_size
@@ -145,10 +126,10 @@ class SpikeGPT(nn.Module):
             max_seq_length = block_size
         if use_kv_cache:  # not relevant otherwise
             assert (
-               max_seq_length >= S
+                max_seq_length >= T
             ), f"Cannot forward sequence of length {T}, max seq length is only {max_seq_length}"
         assert max_seq_length <= block_size, f"Cannot attend to {max_seq_length}, block size is only {block_size}"
-        assert block_size >= S, f"Cannot forward sequence of length {T}, block size is only {block_size}"
+        assert block_size >= T, f"Cannot forward sequence of length {T}, block size is only {block_size}"
 
         # passing `attn_mask` to SDPA downgrades it to use the inefficient implementation. since we only need the mask
         # for the kv-cache support (only during inference), we only create it in that situation
@@ -157,30 +138,28 @@ class SpikeGPT(nn.Module):
             self.mask_cache = self.build_mask_cache(idx)
 
         if use_kv_cache:
-            mask = self.mask_cache.index_select(3, input_pos)
-            mask = mask[:, :, :, :, :max_seq_length]
+            mask = self.mask_cache.index_select(2, input_pos)
+            mask = mask[:, :, :, :max_seq_length]
         else:
             mask = None
         
-        # forward the model itsel
+        # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        x = x + self.poe[:S, :].unsqueeze(0)
-        x = repeat(x, "b s d -> t b s d", t=self.T)
+        x = x + self.poe[:T, :].unsqueeze(0)
             
         if not use_kv_cache:
             for block in self.transformer.h:
-                x, *_ = block(x, max_seq_length)
+                x, pairs, *_ = block(x, pairs, max_seq_length)
         else:
             self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length)
             for i, block in enumerate(self.transformer.h):
-                x, self.kv_caches[i] = block(x, max_seq_length, mask, input_pos, self.kv_caches[i])
-        
+                x, pairs, self.kv_caches[i] = block(x, pairs, max_seq_length, mask, input_pos, self.kv_caches[i])
+
         x = self.transformer.ln_f(x)
         x = self.out_if(x)
 
         x = self.lm_head(x)  # (b, t, vocab_size)
-        x = x.mean(dim=0)
-        return x
+        return x, pairs
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -188,14 +167,14 @@ class SpikeGPT(nn.Module):
 
     def build_mask_cache(self, idx: torch.Tensor) -> torch.Tensor:
         ones = torch.ones((self.config.block_size, self.config.block_size), device=idx.device, dtype=torch.bool)
-        return torch.tril(ones).unsqueeze(0).unsqueeze(0).unsqueeze(0)
+        return torch.tril(ones).unsqueeze(0).unsqueeze(0)
 
     def build_kv_caches(self, idx: torch.Tensor, max_seq_length: int, rope_cache_length: int) -> List[KVCache]:
-        B = idx.size(1)
+        B = idx.size(0)
         heads = 1 if self.config.n_query_groups == 1 else self.config.n_query_groups
 
-        k_cache_shape = (self.T, B, max_seq_length, heads, self.config.head_size)
-        v_cache_shape = (self.T, B, max_seq_length, heads, self.config.head_size)
+        k_cache_shape = (B, max_seq_length, heads, self.config.head_size)
+        v_cache_shape = (B, max_seq_length, heads, self.config.head_size)
         device = idx.device
         return [
             (torch.zeros(k_cache_shape, device=device), torch.zeros(v_cache_shape, device=device))
@@ -203,36 +182,35 @@ class SpikeGPT(nn.Module):
         ]
 
 class Block(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, idx=0) -> None:
         super().__init__()
-        self.norm_1 = WaitLayerNorm(config.n_embd, T_total)
-        self.act_1 = IF(step=time_step)
-        self.attn = CausalSelfAttention(config)
+        self.idx = idx
+        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.act_1 = QuantReLU()
+        self.attn = CausalSelfAttention(config, self.idx)
         if not config.shared_attention_norm:
-            self.norm_2 = WaitLayerNorm(config.n_embd, T_total)
-            self.act_2 = IF(step=time_step)
-        self.mlp = GptNeoxMLP(config)
+            self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
+            self.act_2 = QuantReLU()
+        self.mlp = GptNeoxMLP(config, self.idx)
         self.config = config
 
     def forward(
         self,
-        x: torch.Tensor,
+        x,
+        pairs, 
         max_seq_length: int,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
-    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
-        T, B, S, D = x.shape
+        ):
+            
         n_1 = self.norm_1(x)
         n_1 = self.act_1(n_1)
-        h, new_kv_cache = self.attn(n_1, max_seq_length, mask, input_pos, kv_cache)
+        h, pairs, new_kv_cache = self.attn(n_1, pairs, max_seq_length, mask, input_pos, kv_cache)
         if self.config.parallel_residual:
-            if self.config.shared_attention_norm:
-                n_2 = n_1
-            else:
-                n_2 = self.norm_2(x)
-                n_2 = self.act_2(n_2)
-            x = x + h + self.mlp(n_2)
+            n_2 = n_1 if self.config.shared_attention_norm else self.act_2(self.norm_2(x))
+            n_3, pairs = self.mlp(n_2, pairs)
+            x = x + h + n_3
         else:
             if self.config.shared_attention_norm:
                 raise NotImplementedError(
@@ -241,19 +219,24 @@ class Block(nn.Module):
                 )
             
             x = x + h
-            x = x + self.mlp(self.act_2(self.norm_2(x)))
-        return x, new_kv_cache
+            y = self.act_2(self.norm_2(x))
+            y, pairs = self.mlp(y, pairs)
+            x = x + y
+        return x, pairs, new_kv_cache
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, idx=0) -> None:
         super().__init__()
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
+        self.idx = idx
+        if self.idx == 0:
+            self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
+            self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
-        self.act_1 = IF(step=time_step)
-        self.act_2 = IF(step=time_step)
-        self.inner_product = SpikeInnerProduct()
+        self.act_1 = QuantReLU()
+        self.act_2 = QuantReLU()
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
@@ -261,20 +244,25 @@ class CausalSelfAttention(nn.Module):
 
     def forward(
         self,
-        x: torch.Tensor,
+        x,
+        pairs,
         max_seq_length: int,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
-    ) -> Tuple[torch.Tensor, Optional[KVCache]]:
-        T, B, S, C = x.shape  # batch size, sequence length, embedding dimensionality (n_embd)
-        x = self.attn(x)
-        qkv = self.act_1(x)
+    ):
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        
+        if self.idx == 0:
+            x = self.encoder1(x)
+            if pairs:
+                pairs[0] = self.attn(self.encoder1(pairs[0]))
+        qkv = self.act_1(self.attn(x))
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
         total_qkv = q_per_kv + 2  # each group has 1+ queries, 1 key, and 1 value
-        qkv = qkv.view(T, B, S, self.config.n_query_groups, total_qkv, self.config.head_size) # (B, T, n_query_groups, total_qkv, hs)
+        qkv = qkv.view(B, T, self.config.n_query_groups, total_qkv, self.config.head_size) # (B, T, n_query_groups, total_qkv, hs)
         # qkv = qkv.permute(0, 2, 3, 1, 4)  # (B, n_query_groups, total_qkv, T, hs)
 
         # split batched computation into three
@@ -287,9 +275,9 @@ class CausalSelfAttention(nn.Module):
         #     k = k.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
         #     v = v.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
 
-        q = q.reshape(T, B, S, -1, self.config.head_size)  # (B, T, nh_q, hs)
-        k = k.reshape(T, B, S, -1, self.config.head_size)  
-        v = v.reshape(T, B, S, -1, self.config.head_size)  
+        q = q.reshape(B,  T, -1, self.config.head_size)  # (B, T, nh_q, hs)
+        k = k.reshape(B,  T, -1, self.config.head_size)  
+        v = v.reshape(B,  T, -1, self.config.head_size)  
 
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
@@ -298,21 +286,25 @@ class CausalSelfAttention(nn.Module):
             if input_pos[-1] >= max_seq_length:
                 input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
                 # shift 1 position to the left
-                cache_k = torch.roll(cache_k, -1, dims=2)
-                cache_v = torch.roll(cache_v, -1, dims=2)
+                cache_k = torch.roll(cache_k, -1, dims=1)
+                cache_v = torch.roll(cache_v, -1, dims=1)
 
-            k = cache_k.index_copy_(2, input_pos, k)
-            v = cache_v.index_copy_(2, input_pos, v)
+            k = cache_k.index_copy_(1, input_pos, k)
+            v = cache_v.index_copy_(1, input_pos, v)
             kv_cache = k, v
-        
+
         y = self.scaled_dot_product_attention(q, k, v, mask=mask)
 
-        y = y.reshape(T, B, S, -1)  # re-assemble all head outputs side by sid
+        y = y.reshape(B, T, C)  # re-assemble all head outputs side by sid
 
         # output projection
+        if self.idx == 0:
+            y = self.encoder2(y)
+            if pairs:
+                pairs[1] = self.proj(self.encoder2(pairs[1]))
         y = self.proj(y)
 
-        return y, kv_cache
+        return y, pairs, kv_cache
 
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -330,12 +322,12 @@ class CausalSelfAttention(nn.Module):
 
             return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=True)
         '''
-        q = q.transpose(3, 2)
-        k = k.transpose(3, 2)
-        v = v.transpose(3, 2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
         if q.size() != k.size():
-             k = k.repeat_interleave(q.shape[2]//k.shape[2], dim=2)
-             v = v.repeat_interleave(q.shape[2]//v.shape[2], dim=2)
+             k = k.repeat_interleave(q.shape[1]//k.shape[1], dim=1)
+             v = v.repeat_interleave(q.shape[1]//v.shape[1], dim=1)
 
         L, S = q.size(-2), k.size(-2)
         scale_factor = 1 / math.sqrt(q.size(-1)) if scale is None else scale
@@ -349,27 +341,38 @@ class CausalSelfAttention(nn.Module):
                 mask.masked_fill_(mask.logical_not(), float("-inf"))
             else:
                 attn_bias += mask
-
-        attn_weight = self.inner_product(q, k.transpose(-2, -1)) * scale_factor
+        attn_weight = q @ k.transpose(-2, -1) * scale_factor
         attn_weight += attn_bias
         attn_weight = torch.softmax(attn_weight, dim=-1)
         #attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
         #attn_weight = self.act_2(attn_weight)
         y = attn_weight @ v
-        return y.transpose(3, 2)
+        return y.transpose(1, 2)
 
 
 class GptNeoxMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, idx=0) -> None:
         super().__init__()
+        self.idx = idx
+        if self.idx == 0:
+            self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
+            self.encoder2 = AutoEncoder(config.intermediate_size, config.intermediate_size)
         self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
-        self.act = IF(step=time_step)
+        self.act = QuantReLU()
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x, pairs):
+        if self.idx == 0:
+            x = self.encoder1(x)
+            if pairs:
+                pairs[2] = self.fc(self.encoder1(pairs[2]))
         x = self.fc(x)
         x = self.act(x)
-        return self.proj(x)
+        if self.idx == 0:
+            x = self.encoder2(x)
+            if pairs:
+                pairs[3] = self.proj(self.encoder2(pairs[3]))
+        return self.proj(x), pairs
 
 
 class LLaMAMLP(nn.Module):
@@ -385,3 +388,5 @@ class LLaMAMLP(nn.Module):
         # x = torch.nn.functional.silu(x_fc_1) * x_fc_2
         # return self.proj(x)
         return self.swiglu(x)
+
+

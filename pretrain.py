@@ -15,6 +15,7 @@ wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 # from apex.optimizers import FusedAdam #torch optimizer has a cuda backend, which is faster actually
 from src.model import GPT, Block, Config, CausalSelfAttention
+from src.quant_model import QuantGPT
 from src.packed_dataset import CombinedDataset, PackedDataset
 from src.speed_monitor import SpeedMonitorFabric as Monitor
 from src.speed_monitor import estimate_flops, measure_flops
@@ -30,9 +31,9 @@ out_dir = Path("out") / name
 # Hyperparameters
 GPU_NUM = 7
 num_of_devices = GPU_NUM
-global_batch_size = GPU_NUM * GPU_NUM * 2
+global_batch_size = GPU_NUM * 2 * 1
 learning_rate = 4e-4
-micro_batch_size = GPU_NUM
+micro_batch_size = 2
 max_step = 40000 * 2
 warmup_steps = 2000
 log_step_interval = 10
@@ -52,8 +53,6 @@ batch_size = global_batch_size // num_of_devices
 gradient_accumulation_steps = batch_size // micro_batch_size
 assert gradient_accumulation_steps > 0
 warmup_iters = warmup_steps * gradient_accumulation_steps
-
-
 
 
 max_iters = max_step * gradient_accumulation_steps
@@ -123,14 +122,17 @@ def main(fabric, train_data_dir, val_data_dir, resume):
     fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.perf_counter()
     with fabric.init_module(empty_init=False):
-        model = GPT(config)
-        model.apply(partial(model._init_weights ,n_layer=config.n_layer))
- 
+        torch_model = QuantGPT(config)
+        torch_model.apply(partial(torch_model._init_weights ,n_layer=config.n_layer))
+        teacher = GPT(config)
+        checkpoint = torch.load(out_dir / "teacher.pth")
+        teacher.load_state_dict(checkpoint['model'], strict=False)
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
-    fabric.print(f"Total parameters {num_parameters(model):,}")
+    fabric.print(f"Total parameters {num_parameters(torch_model):,}")
 
-    model = fabric.setup(model)
+    model = fabric.setup(torch_model)
+    teacher = fabric.setup_module(teacher)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False
     )
@@ -148,13 +150,13 @@ def main(fabric, train_data_dir, val_data_dir, resume):
         state['optimizer'] = optimizer
 
     train_time = time.perf_counter()
-    train(fabric, state, train_dataloader, val_dataloader, monitor, resume)
+    train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, resume)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 
-def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
+def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, resume):
     model = state["model"]
     optimizer = state["optimizer"]
 
@@ -187,6 +189,7 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
     curr_iter = 0
             
     loss_func = FusedCrossEntropyLoss()
+    act_loss_func = torch.nn.MSELoss()
     for  train_data in train_dataloader:
         # resume loader state. This is not elegant but it works. Should rewrite it in the future.
         if resume:
@@ -211,9 +214,23 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
         input_ids = train_data[:, 0 : model.config.block_size].contiguous()
         targets = train_data[:, 1 : model.config.block_size + 1].contiguous()
         is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
+        mu = 0.7
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            logits = model(input_ids)
-            loss = loss_func(logits, targets)
+            with torch.no_grad():
+                _ = teacher(input_ids)
+            pairs = teacher.get_pairs()
+            input_pairs = []
+            target_pairs = []
+            for i in range(len(pairs)):
+                input_pairs.append(pairs[i][0].to(torch.float32))
+                target_pairs.append(pairs[i][1].to(torch.float32))
+            logits, student_pairs = model(input_ids, input_pairs, None, None)
+
+            student_concat = torch.concat(student_pairs, dim=-1).to(torch.float32)
+            target_concat = torch.concat(target_pairs, dim=-1).to(torch.float32)
+            loss1 = act_loss_func(student_concat, target_concat)
+            loss2 = loss_func(logits, targets)
+            loss = mu * loss1 + (1 - mu) * loss2
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)
 
@@ -277,7 +294,7 @@ def validate(fabric: L.Fabric, model: torch.nn.Module, val_dataloader: DataLoade
             break
         input_ids = val_data[:, 0 : model.config.block_size].contiguous()
         targets = val_data[:, 1 : model.config.block_size + 1].contiguous()
-        logits = model(input_ids)
+        logits, _ = model(input_ids)
         loss = chunked_cross_entropy(logits, targets, chunk_size=0)
 
         # loss_func = FusedCrossEntropyLoss()
@@ -317,8 +334,8 @@ def create_dataloaders(
     batch_size: int,
     block_size: int,
     fabric,
-    train_data_dir: Path = Path("data/bookcorpus"),
-    val_data_dir: Optional[Path] = Path("data/bookcorpus"),
+    train_data_dir: Path = Path("data/slimpajama"),
+    val_data_dir: Optional[Path] = Path("data/slimpajama"),
     seed: int = 12345,
 ) -> Tuple[DataLoader, DataLoader]:
     # Increase by one because we need the next word as well

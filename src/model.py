@@ -16,6 +16,7 @@ from src.config import Config
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 #FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
 
+@torch.no_grad()
 def act_quantization(b):
     def uniform_quant(x, b):
         xdiv = x.mul(2 ** b - 1)
@@ -44,12 +45,13 @@ def act_quantization(b):
     return _uq().apply
 
 class QuantReLU(nn.ReLU):
-    def __init__(self):
+    def __init__(self, bit=32):
         super().__init__()
-        self.bit = 32
+        self.bit = bit
         self.act_alq = act_quantization(self.bit)
         self.act_alpha = torch.nn.Parameter(torch.tensor(8.0))
 
+    @torch.no_grad()
     def forward(self, x):
         x = F.relu(x)
         if self.bit < 16:
@@ -69,7 +71,7 @@ class GPT(nn.Module):
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
+                h=nn.ModuleList(Block(config, i) for i in range(config.n_layer)),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
@@ -99,6 +101,7 @@ class GPT(nn.Module):
             # https://github.com/Lightning-AI/lit-gpt/pull/83#issuecomment-1558150179
             self.mask_cache = None
 
+    @torch.no_grad()
     def forward(
         self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
@@ -144,6 +147,9 @@ class GPT(nn.Module):
 
         x = self.lm_head(x)  # (b, t, vocab_size)
         return x
+   
+    def get_pairs(self):
+        return self.transformer.h[0].pairs
 
     @classmethod
     def from_name(cls, name: str, **kwargs: Any) -> Self:
@@ -166,17 +172,20 @@ class GPT(nn.Module):
         ]
 
 class Block(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, idx=0) -> None:
         super().__init__()
+        self.idx = idx
         self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
         self.act_1 = QuantReLU()
-        self.attn = CausalSelfAttention(config)
+        self.attn = CausalSelfAttention(config, self.idx)
         if not config.shared_attention_norm:
             self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
             self.act_2 = QuantReLU()
-        self.mlp = config.mlp_class(config)
+        self.mlp = config.mlp_class(config, self.idx)
         self.config = config
+        self.pairs = []
 
+    @torch.no_grad()
     def forward(
         self,
         x: torch.Tensor,
@@ -189,6 +198,7 @@ class Block(nn.Module):
         n_1 = self.norm_1(x)
         n_1 = self.act_1(n_1)
         h, new_kv_cache = self.attn(n_1, max_seq_length, mask, input_pos, kv_cache)
+        
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.act_2(self.norm_2(x))
             x = x + h + self.mlp(n_2)
@@ -201,12 +211,16 @@ class Block(nn.Module):
             
             x = x + h
             x = x + self.mlp(self.act_2(self.norm_2(x)))
+        if self.idx == 0:
+            self.pairs = self.attn.pairs + self.mlp.pairs
         return x, new_kv_cache
 
-
+        
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, idx=0) -> None:
         super().__init__()
+        self.idx = idx
+        self.pairs = [torch.zeros([1]), torch.zeros([1])]
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
@@ -217,6 +231,7 @@ class CausalSelfAttention(nn.Module):
 
         self.config = config
 
+    @torch.no_grad()
     def forward(
         self,
         x: torch.Tensor,
@@ -227,7 +242,10 @@ class CausalSelfAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        qkv = self.act_1(self.attn(x))
+        w = self.attn(x)
+        if self.idx == 0:
+            self.pairs[0] = [x, w]
+        qkv = self.act_1(w)
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
@@ -268,9 +286,12 @@ class CausalSelfAttention(nn.Module):
         y = y.reshape(B, T, C)  # re-assemble all head outputs side by sid
 
         # output projection
-        y = self.proj(y)
 
-        return y, kv_cache
+        out = self.proj(y)
+        if self.idx == 0:
+            self.pairs[1] = [y, out]
+
+        return out, kv_cache
 
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -315,19 +336,25 @@ class CausalSelfAttention(nn.Module):
         y = attn_weight @ v
         return y.transpose(1, 2)
 
-
 class GptNeoxMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, idx=0) -> None:
         super().__init__()
+        self.idx = idx
+        self.pairs = [torch.zeros([1]), torch.zeros([1])]
         self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         self.act = QuantReLU()
 
+    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc(x)
-        x = self.act(x)
-        return self.proj(x)
-
+        w = self.fc(x)
+        if self.idx == 0:
+            self.pairs[0] = [x, w]
+        x = self.act(w)
+        out = self.proj(x)
+        if self.idx == 0:
+            self.pairs[1] = [x, out]
+        return out
 
 class LLaMAMLP(nn.Module):
     def __init__(self, config: Config) -> None:
@@ -336,6 +363,8 @@ class LLaMAMLP(nn.Module):
         # self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         # self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
+
+    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x_fc_1 = self.fc_1(x)
         # x_fc_2 = self.fc_2(x)
