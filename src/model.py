@@ -16,6 +16,7 @@ from src.config import Config
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 #FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
 
+'''
 def act_quantization(b):
     def uniform_quant(x, b):
         xdiv = x.mul(2 ** b - 1)
@@ -56,6 +57,7 @@ class QuantReLU(nn.ReLU):
             return self.act_alq(x, self.act_alpha)
         else:
             return x.clamp(min=0, max=self.act_alpha.item())
+'''
 
 class GPT(nn.Module):
     def __init__(self, config: Config) -> None:

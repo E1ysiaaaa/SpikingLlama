@@ -6,6 +6,7 @@ import os
 import random
 import struct
 
+import subprocess
 import numpy as np
 import torch
 from torch.utils.data import IterableDataset, get_worker_info
@@ -89,6 +90,9 @@ class PackedDatasetBuilder(object):
             f.write(struct.pack("<B", code(self._dtype)))
             f.write(struct.pack("<Q", self._chunk_size))
             f.write(self._arr.tobytes(order="C"))
+
+        subprocess.run(["scp", filename, "zju1207@10.66.56.23:~/SpikingLlaMA/data/slimpajama"])
+        os.remove(filename)
 
         self._filenames.append(filename)
         self._counter += 1
