@@ -12,8 +12,8 @@ import torch
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 
-from lit_gpt import Config
-from lit_gpt.utils import NotYetLoadedTensor, incremental_save, lazy_load
+from src import Config
+from src.utils import NotYetLoadedTensor, incremental_save, lazy_load
 
 
 def copy_weights_gpt_neox(
@@ -192,7 +192,7 @@ def load_param(param: Union[torch.Tensor, NotYetLoadedTensor], name: str, dtype:
 @torch.inference_mode()
 def convert_hf_checkpoint(
     *,
-    checkpoint_dir: Path = Path("checkpoints/stabilityai/stablelm-base-alpha-3b"),
+    checkpoint_dir: Path = Path("/data4/TinyLlama"),
     model_name: Optional[str] = None,
     dtype: Optional[str] = None,
 ) -> None:

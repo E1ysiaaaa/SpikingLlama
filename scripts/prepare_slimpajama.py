@@ -1,6 +1,7 @@
 import json
 import glob
 import os
+import random
 from pathlib import Path
 import sys
 from typing import List
@@ -56,10 +57,10 @@ def prepare_full(
         vocab_size=tokenizer.vocab_size,
     )
 
-    for filepath in filenames:
+    for filepath in tqdm(filenames):
         print(f"Processing {filepath}")
         with zstd.open(open(filepath, "rb"), "rt", encoding="utf-8") as f:
-            for row in tqdm(f):
+            for row in f:
                 text = json.loads(row)["text"]
                 #if json.loads(row)["meta"]["redpajama_set_name"] == "RedPajamaGithub":
                 #    continue # we don't want to include the github data
@@ -71,9 +72,9 @@ def prepare_full(
 
 
 def prepare(
-    source_path: Path = Path("data/SlimPajama-627B"),
+    source_path: Path = Path("/data4/SlimPajama-627B"),
     tokenizer_path: Path = Path("checkpoints/"),
-    destination_path: Path = Path("data/slim_star_combined"),
+    destination_path: Path = Path("/data4/slim_star_combined"),
     chunk_size: int = 2049 * 1024,
     split: str="train",
     percentage: float = 1.0,

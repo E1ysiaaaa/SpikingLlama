@@ -1,5 +1,7 @@
 from src.model import GPT
 from src.spike_model import SpikeGPT, IF, SpikeInnerProduct
+from src.model import GPT
+from src.quant_model import QuantGPT
 from src.config import Config
 from src.tokenizer import Tokenizer
 
@@ -26,11 +28,11 @@ from lm_eval.__main__ import cli_evaluate
 class SpikeGPTFull(nn.Module):
     def __init__(self, pretrained):
         super().__init__()
-        model_name = "tiny_LLaMA_120M"
+        model_name = "tiny_LLaMA_1b"
         self.config = Config.from_name(model_name)
         self.model = GPT(self.config)
         checkpoint = torch.load(pretrained)
-        self.model.load_state_dict(checkpoint['model'], strict=True)
+        self.model.load_state_dict(checkpoint, strict=False)
         tokenizer_path = Path("checkpoints/")
         self.tokenizer = Tokenizer(tokenizer_path)
 
@@ -175,8 +177,8 @@ class SpikeGPTFull(nn.Module):
 class SpikeLlamaWrapper(HFLM):
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
 
-    def __init__(self, pretrained="out/spiking-llama-120m/iter-075000-ckpt.pth", max_length=512, batch_size=None, device="cuda",
-                 dtype=torch.float16):
+    def __init__(self, pretrained="out/spiking-llama-1b/teacher.pth", max_length=512, batch_size=None, device="cuda",
+                 dtype=torch.float32):
         LM.__init__(self)
         self._model = SpikeGPTFull(pretrained).to(device=device, dtype=dtype)
 
@@ -194,16 +196,6 @@ class SpikeLlamaWrapper(HFLM):
 
     def _model_generate(self, context, max_length, stop, **generation_kwargs):
         raise NotImplementedError()
-
-def main(task: str):
-    model_name = "tiny_LLaMA_120M"
-    checkpoint_path = "out/spiking-llama-120m/iter-075000-ckpt.pth"
-    tokenizer_path = Path("checkpoints/")
-    tokenizer = Tokenizer(tokenizer_path)
-    config = Config.from_name(model_name)
-    model = SpikeGPT(config).to("cuda")
-    checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint['model'], strict=True)
 
 if __name__ == "__main__":
     os.environ['HF_ENDPOINT'] = "https://hf-mirror.com"

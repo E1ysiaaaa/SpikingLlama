@@ -89,9 +89,12 @@ class Config:
             from src.rmsnorm import RMSNorm
 
             return RMSNorm
+        # FusedRMSNorm takes forever to compile, so I use RMSNorm instead
         elif self._norm_class == "FusedRMSNorm":
-            from src.rmsnorm import FusedRMSNorm
-            return FusedRMSNorm
+            #from src.rmsnorm import FusedRMSNorm
+            from src.rmsnorm import RMSNorm
+            #return FusedRMSNorm
+            return RMSNorm
         return getattr(torch.nn, self._norm_class)
 
 
@@ -266,7 +269,7 @@ tiny_LLaMA = [
     dict(
         org="StatNLP-research",
         name="tiny_LLaMA_120M",
-        block_size=512,
+        block_size=2048,
         vocab_size=32000,
         padding_multiple=64,
         n_layer=12,
@@ -275,7 +278,11 @@ tiny_LLaMA = [
         rotary_percentage=1.0,
         parallel_residual=False,
         bias=False,
+        _norm_class="FusedRMSNorm",
         norm_eps=1e-5,
+        _mlp_class="LLaMAMLP",
+        intermediate_size=2048,
+        n_query_groups=1,
     ),
     dict(
         org="StatNLP-research",
