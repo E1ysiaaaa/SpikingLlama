@@ -161,7 +161,7 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         if not config.shared_attention_norm:
             self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.mlp = config.mlp_class(config)
+        self.mlp = LLaMAMLP(config)
         self.config = config
         self.pairs = [0, 0, 0, 0, 0]
 
@@ -325,23 +325,23 @@ class GptNeoxMLP(nn.Module):
 class LLaMAMLP(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
-        self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        #self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        #self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        #self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         self.pairs = [0, 0, 0]
-        #self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
+        self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x_fc_1 = self.fc_1(x)
-        self.pairs[0] = [x, x_fc_1]
-        x_fc_2 = self.fc_2(x)
-        self.pairs[1] = [x, x_fc_2]
-        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
-        y = self.proj(x)
-        self.pairs[2] = [x, y]
-        return y
-        #return self.swiglu(x)
+        #x_fc_1 = self.fc_1(x)
+        #self.pairs[0] = [x, x_fc_1]
+        #x_fc_2 = self.fc_2(x)
+        #self.pairs[1] = [x, x_fc_2]
+        #x = torch.nn.functional.silu(x_fc_1) * x_fc_2
+        #y = self.proj(x)
+        #self.pairs[2] = [x, y]
+        #return y
+        return self.swiglu(x)
 
 
 def build_rope_cache(
