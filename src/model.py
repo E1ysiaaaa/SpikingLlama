@@ -12,7 +12,7 @@ from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
 from flash_attn import flash_attn_func
 from src.config import Config
-from xformers.ops import SwiGLU
+#from xformers.ops import SwiGLU
 from transformers.utils import is_torch_bf16_gpu_available
 from .fused_rotary_embedding import apply_rotary_emb_func
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
@@ -321,27 +321,37 @@ class GptNeoxMLP(nn.Module):
         x = torch.nn.functional.gelu(x)
         return self.proj(x)
 
-
 class LLaMAMLP(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
-        #self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        #self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        #self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        self.swiglu = SwiGLU(config)
         self.pairs = [0, 0, 0]
-        self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.swiglu(x)
+        self.pairs = self.swiglu.pairs
+        return out
+
+class SwiGLU(nn.Module):
+    def __init__(self, config: Config) -> None:
+        super().__init__()
+        self.w1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        self.w2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        self.pairs = [0, 0, 0]
+        #self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        #x_fc_1 = self.fc_1(x)
-        #self.pairs[0] = [x, x_fc_1]
-        #x_fc_2 = self.fc_2(x)
-        #self.pairs[1] = [x, x_fc_2]
-        #x = torch.nn.functional.silu(x_fc_1) * x_fc_2
-        #y = self.proj(x)
-        #self.pairs[2] = [x, y]
-        #return y
-        return self.swiglu(x)
+        x_fc_1 = self.w1(x)
+        self.pairs[0] = [x, x_fc_1]
+        x_fc_2 = self.w2(x)
+        self.pairs[1] = [x, x_fc_2]
+        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
+        y = self.w3(x)
+        self.pairs[2] = [x, y]
+        return y
+        #return self.swiglu(x)
 
 
 def build_rope_cache(

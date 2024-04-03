@@ -15,7 +15,7 @@ from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
 from flash_attn import flash_attn_func
 from src.config import Config
-from xformers.ops import SwiGLU
+#from xformers.ops import SwiGLU
 from .fused_rotary_embedding import apply_rotary_emb_func
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
@@ -411,8 +411,15 @@ class GptNeoxMLP(nn.Module):
         x = torch.nn.functional.gelu(x)
         return self.proj(x)
 
-
 class LLaMAMLP(nn.Module):
+    def __init__(self, config: Config, quant=False):
+        super().__init__()
+        self.swiglu = SwiGLU(config, quant)
+
+    def forward(self, x, input_pairs=None, target_pairs=None):
+        return self.swiglu(x, input_pairs, target_pairs)
+
+class SwiGLU(nn.Module):
     def __init__(self, config: Config, quant=False) -> None:
         super().__init__()
         self.quant = quant
@@ -420,9 +427,9 @@ class LLaMAMLP(nn.Module):
             self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
             self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
             self.encoder3 = AutoEncoder(config.intermediate_size, config.intermediate_size)
-        self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+        self.w1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        self.w2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         #self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
     def forward(self, x: torch.Tensor, input_pairs=None, target_pairs=None) -> torch.Tensor:
         loss = 0
@@ -432,26 +439,26 @@ class LLaMAMLP(nn.Module):
             x2 = self.encoder2(x)
         else:
             x1 = x2 = x
-        x_fc_1 = self.fc_1(x1)
-        x_fc_2 = self.fc_2(x2)
+        x_fc_1 = self.w1(x1)
+        x_fc_2 = self.w2(x2)
         x = torch.nn.functional.silu(x_fc_1) * x_fc_2
         if self.quant:
             x = self.encoder3(x)
-        y = self.proj(x)
+        y = self.w3(x)
 
         if input_pairs is not None:
             x_quant = self.encoder1(input_pairs[2])
-            out_pair = self.fc_1(x_quant)
+            out_pair = self.w1(x_quant)
             #loss = loss + mu * F.mse_loss(x_quant, input_pairs[2]) + (1-mu) * F.mse_loss(out_pair, target_pairs[2])
             loss = loss + F.mse_loss(out_pair, target_pairs[2])
         if input_pairs is not None:
             x_quant = self.encoder2(input_pairs[3])
-            out_pair = self.fc_2(x_quant)
+            out_pair = self.w2(x_quant)
             #loss = loss + mu * F.mse_loss(x_quant, input_pairs[3]) + (1-mu) * F.mse_loss(out_pair, target_pairs[3])
             loss = loss + F.mse_loss(out_pair, target_pairs[3])
         if input_pairs is not None:
             x_quant = self.encoder3(input_pairs[4])
-            out_pair = self.proj(x_quant)
+            out_pair = self.w3(x_quant)
             #loss = loss + mu * F.mse_loss(x_quant, input_pairs[4]) + (1-mu) * F.mse_loss(out_pair, target_pairs[4])
             loss = loss + F.mse_loss(out_pair, target_pairs[4])
             
