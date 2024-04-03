@@ -36,10 +36,10 @@ class ApplyRotaryEmb(torch.autograd.Function):
                 if not interleaved
                 else (out_ro[..., ::2], out_ro[..., 1::2])
             )
-        # print(x1.dtype)
-        # print(cos.dtype)
-        cos = cos.to(torch.float32)
-        sin = sin.to(torch.float32)
+        #print(x1.dtype)
+        #print(cos.dtype)
+        #cos = cos.to(torch.float32)
+        #sin = sin.to(torch.float32)
         rotary_emb.apply_rotary(
             x1,
             x2,
