@@ -31,7 +31,7 @@ out_dir = Path("out") / name
 # Hyperparameters
 GPU_NUM = 8
 num_of_devices = GPU_NUM
-global_batch_size = GPU_NUM * 2 * 1
+global_batch_size = GPU_NUM * 2 * 1   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
 learning_rate = 4e-4
 micro_batch_size = 2
 max_step = 40000 * 2
@@ -122,6 +122,8 @@ def main(fabric, train_data_dir, val_data_dir, resume):
 
     fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.perf_counter()
+
+    # Load teacher and student models, student models with same initialization to teacher model.
     with fabric.init_module(empty_init=False):
         torch_model = QuantGPT(config)
         torch_model.apply(partial(torch_model._init_weights ,n_layer=config.n_layer))
@@ -159,7 +161,7 @@ def main(fabric, train_data_dir, val_data_dir, resume):
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
-
+# Training details here
 def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, resume):
     model = state["model"]
     optimizer = state["optimizer"]
@@ -219,18 +221,16 @@ def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, res
         is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
         mu = 0.7
         with fabric.no_backward_sync(model, enabled=is_accumulating):
+            # get all the input and output of linear layers in block(layer)
             pairs = teacher(input_ids, layer=1)
             input_pairs = []
             target_pairs = []
             for i in range(len(pairs)):
                 input_pairs.append(pairs[i][0].to(torch.float32))
                 target_pairs.append(pairs[i][1].to(torch.float32))
-            #logits, student_pairs = model(input_ids, input_pairs, None, None)
 
-            #student_concat = torch.concat(student_pairs, dim=-1).to(torch.float32)
-            #target_concat = torch.concat(target_pairs, dim=-1).to(torch.float32)
-            #loss1 = act_loss_func(student_concat, target_concat)
             logits, mseloss = model(input_ids, input_pairs=input_pairs, target_pairs=target_pairs)
+            # Consider the global and local loss
             loss = mu * mseloss + (1-mu) * loss_func(logits, targets)
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)

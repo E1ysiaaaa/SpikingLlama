@@ -1,6 +1,5 @@
 from src.model import GPT
 from src.spike_model import SpikeGPT, IF, SpikeInnerProduct
-from src.model import GPT
 from src.quant_model import QuantGPT
 from src.config import Config
 from src.tokenizer import Tokenizer
@@ -25,11 +24,14 @@ from lm_eval.models.huggingface import HFLM
 from lm_eval.api.registry import register_model
 from lm_eval.__main__ import cli_evaluate
 
+# A wrapper to the original model
 class SpikeGPTFull(nn.Module):
     def __init__(self, pretrained):
         super().__init__()
         model_name = "tiny_LLaMA_1b"
         self.config = Config.from_name(model_name)
+
+        # Choose the model you want to evaluate.
         self.model = GPT(self.config)
         checkpoint = torch.load(pretrained)
         self.model.load_state_dict(checkpoint, strict=False)
@@ -37,10 +39,12 @@ class SpikeGPTFull(nn.Module):
         self.tokenizer = Tokenizer(tokenizer_path)
 
     def forward(self, x, max_len=None, input_pos=None):
+        # Normal GPT generation, no input_pairs or target_pairs
         lm_logits = self.model.forward(x, max_len, input_pos)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 
+    # Copied from others
     @torch.inference_mode()
     def generate(
         self,
@@ -173,10 +177,12 @@ class SpikeGPTFull(nn.Module):
         next_token = torch.gather(probs_idx, -1, next_token)
         return next_token
 
+# A wrapper for huggingface evaluation toolset
 @register_model("spikellama")
 class SpikeLlamaWrapper(HFLM):
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
 
+    # change you checkpoint path here (pretrained)
     def __init__(self, pretrained="out/spiking-llama-1b/teacher.pth", max_length=512, batch_size=None, device="cuda",
                  dtype=torch.float32):
         LM.__init__(self)
