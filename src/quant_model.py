@@ -37,11 +37,11 @@ def act_heaveside(scale):
         def backward(ctx, grad_output):
             grad_input = grad_output.clone()
             y, alpha = ctx.saved_tensors
-            alpha_d = (y > 0).float() - (y < 0).float()
+            alpha_d = 2 / pi * torch.arctan(y)
             grad_alpha = alpha_d * grad_input
-            arctan_d = 2 / pi * scale / sqrt((scale * y) ** 2 + 1)
-            grad_input = alpha * arctan_d
-            grad_beta = -alpha * arctan_d
+            arctan_d = 2 / pi * scale / torch.sqrt((scale * y) ** 2 + 1)
+            grad_beta = -alpha * arctan_d * grad_input
+            grad_input = alpha * arctan_d * grad_input
             return grad_input.to(grad_output.dtype), grad_alpha.to(grad_output.dtype), grad_beta.to(grad_output.dtype)
 
     return _uq().apply
