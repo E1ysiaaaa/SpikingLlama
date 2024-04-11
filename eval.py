@@ -24,6 +24,11 @@ from lm_eval.models.huggingface import HFLM
 from lm_eval.api.registry import register_model
 from lm_eval.__main__ import cli_evaluate
 
+
+# export HF_ENDPOINT=https://hf-mirror.com
+# python3 eval.py --model spikellama --tasks=piqa,winogrande,lambada,arc_easy
+
+
 # A wrapper to the original model
 class SpikeGPTFull(nn.Module):
     def __init__(self, pretrained):
@@ -32,15 +37,15 @@ class SpikeGPTFull(nn.Module):
         self.config = Config.from_name(model_name)
 
         # Choose the model you want to evaluate.
-        self.model = GPT(self.config)
+        self.model = QuantGPT(self.config)
         checkpoint = torch.load(pretrained)
-        self.model.load_state_dict(checkpoint, strict=False)
+        self.model.load_state_dict(checkpoint['model'], strict=False)
         tokenizer_path = Path("checkpoints/")
         self.tokenizer = Tokenizer(tokenizer_path)
 
     def forward(self, x, max_len=None, input_pos=None):
         # Normal GPT generation, no input_pairs or target_pairs
-        lm_logits = self.model.forward(x, max_len, input_pos)
+        lm_logits = self.model.forward(x, max_seq_length=max_len, input_pos=input_pos)
         CausalLMOutput = namedtuple("CausalLMOutput", ["logits"])
         return CausalLMOutput(logits=lm_logits)
 
@@ -183,7 +188,7 @@ class SpikeLlamaWrapper(HFLM):
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
 
     # change you checkpoint path here (pretrained)
-    def __init__(self, pretrained="out/spiking-llama-1b/teacher.pth", max_length=512, batch_size=None, device="cuda",
+    def __init__(self, pretrained="out/spiking-llama-1b/iter-067000-ckpt.pth", max_length=512, batch_size=None, device="cuda",
                  dtype=torch.float32):
         LM.__init__(self)
         self._model = SpikeGPTFull(pretrained).to(device=device, dtype=dtype)

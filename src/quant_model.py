@@ -40,8 +40,8 @@ def act_heaveside(scale):
             alpha_d = (y > 0).float() - (y < 0).float()
             grad_alpha = alpha_d * grad_input
             arctan_d = 2 / pi * scale / sqrt((scale * y) ** 2 + 1)
-            grad_input = alpha * arctan_d
-            grad_beta = -alpha * arctan_d
+            grad_beta = -alpha * arctan_d * grad_input
+            grad_input = alpha * arctan_d * grad_input
             return grad_input.to(grad_output.dtype), grad_alpha.to(grad_output.dtype), grad_beta.to(grad_output.dtype)
 
     return _uq().apply
@@ -66,9 +66,12 @@ class AutoEncoder(nn.Module):
         self.act1 = nn.ReLU()
         self.act2 = ParamHeavside(self.out_size)
 
-    def forward(self, x):
-        out = self.act1(self.linear1(x))
-        out = self.act2(self.linear2(out))
+    def forward(self, x, infer=False):
+        if not infer:
+            out = self.act1(self.linear1(x))
+            out = self.act2(self.linear2(out))
+        else:
+            seq_len = x.shape[-1]
         return out
 
 class QuantGPT(nn.Module):
@@ -184,7 +187,8 @@ class QuantGPT(nn.Module):
         return build_rope_cache(
             seq_len=self.config.block_size,
             n_elem=int(self.config.rotary_percentage * self.config.head_size),
-            dtype=torch.bfloat16,
+            #dtype=torch.bfloat16,
+            dtype=idx.dtype,
             device=idx.device,
             condense_ratio=self.config.condense_ratio,
         )
@@ -276,6 +280,7 @@ class CausalSelfAttention(nn.Module):
         if self.quant:
             self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
             self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
+            #self.softmax_encoder = AutoEncoder(config.block_size, config.block_size)
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
@@ -294,7 +299,7 @@ class CausalSelfAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
         loss = 0
-        mu = 0.3
+        mu = 0.25
 
         if self.quant:
             x = self.encoder1(x)
@@ -302,7 +307,7 @@ class CausalSelfAttention(nn.Module):
         if input_pairs is not None:
             x_quant = self.encoder1(input_pairs[0])
             out_pair = self.attn(x_quant)
-            #loss = loss + mu * F.mse_loss(x_quant, input_pairs[0]) + (1-mu) * F.mse_loss(out_pair, target_pairs[0])
+            #loss = loss + mu * F.mse_loss(x_quant, input_pairs[0]) + (1-2*mu) * F.mse_loss(out_pair, target_pairs[0]) + mu * F.mse_loss(self.attn)
             loss = loss + F.mse_loss(out_pair, target_pairs[0])
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
@@ -394,9 +399,28 @@ class CausalSelfAttention(nn.Module):
         if q.size() != k.size():
              k = k.repeat_interleave(q.shape[1]//k.shape[1], dim=1)
              v = v.repeat_interleave(q.shape[1]//v.shape[1], dim=1)
-        y = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
-        )
+
+        L, S = q.size(-2), k.size(-2)
+        scale_factor = 1 / math.sqrt(q.size(-1)) if scale is None else scale
+        attn_bias = torch.zeros(L, S, dtype=q.dtype, device=q.device)
+        if mask is None:
+            temp_mask = torch.ones(L, S, dtype=torch.bool, device=q.device).tril(diagonal=0)
+            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            attn_bias.to(q.dtype)
+        else:
+            if mask.dtype == torch.bool:
+                mask.masked_fill_(mask.logical_not(), float("-inf"))
+            else:
+                attn_bias += mask
+        attn_weight = q @ k.transpose(-2, -1) * scale_factor
+        attn_weight += attn_bias
+        if self.quant:
+            #attn_weight = self.softmax_encoder(attn_weight)
+            attn_weight = torch.softmax(attn_weight, dim=-1)
+        else:
+            attn_weight = torch.softmax(attn_weight, dim=-1)
+        attn_weight = torch.dropout(attn_weight, 0.0, train=True)
+        y = attn_weight @ v
         return y.transpose(1, 2)
 
 

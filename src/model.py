@@ -127,7 +127,8 @@ class GPT(nn.Module):
         return build_rope_cache(
             seq_len=self.config.block_size,
             n_elem=int(self.config.rotary_percentage * self.config.head_size),
-            dtype=torch.bfloat16,
+            #dtype=torch.bfloat16,
+            dtype=idx.dtype,
             device=idx.device,
             condense_ratio=self.config.condense_ratio,
         )

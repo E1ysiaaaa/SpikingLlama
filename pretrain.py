@@ -31,15 +31,15 @@ out_dir = Path("out") / name
 # Hyperparameters
 GPU_NUM = 8
 num_of_devices = GPU_NUM
-global_batch_size = GPU_NUM * 2 * 1   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
+global_batch_size = GPU_NUM * 4 * 1   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
 learning_rate = 4e-4
-micro_batch_size = 2
+micro_batch_size = 4
 max_step = 40000 * 2
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
-save_step_interval = 5000
-eval_step_interval = 5000
+save_step_interval = 1000
+eval_step_interval = 1000
 
 
 weight_decay = 1e-1
@@ -225,6 +225,8 @@ def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, res
             pairs = teacher(input_ids, layer=1)
             input_pairs = []
             target_pairs = []
+            
+
             for i in range(len(pairs)):
                 input_pairs.append(pairs[i][0].to(torch.float32))
                 target_pairs.append(pairs[i][1].to(torch.float32))
