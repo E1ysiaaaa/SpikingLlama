@@ -70,16 +70,16 @@ def sample_top_p(probs, p):
 
 def main():
     model_name = "tiny_LLaMA_1b"
-    checkpoint_path = "out/spiking-llama-1b/iter-060000-ckpt.pth"
+    checkpoint_path = "out/teacher.pth"
     #checkpoint_path = "out/spiking-llama-1b/teacher.pth"
     tokenizer_path = Path("checkpoints/")
     tokenizer = Tokenizer(tokenizer_path)
     config = Config.from_name(model_name)
-    model = QuantGPT(config).to("cuda")
+    model = GPT(config).to("cuda")
     checkpoint = torch.load(checkpoint_path)
-    model.load_state_dict(checkpoint["model"], strict=False)
+    model.load_state_dict(checkpoint, strict=False)
 
-    input_text = "All at once she understood why this whole day she'd felt even more consumed by Daniel than usual, and also even more conflicted about Cam. She'd dreamed about them both last night. She'd been wandering through a dusty fog, someone holding her hand. She'd turned, thinking it would be "
+    input_text = "Hello, I am"
     max_gen_len = 20
     input_tokens = tokenizer.encode(input_text)
     prompt_tokens = input_tokens[:-1]

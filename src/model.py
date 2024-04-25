@@ -164,7 +164,7 @@ class Block(nn.Module):
             self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
         self.mlp = LLaMAMLP(config)
         self.config = config
-        self.pairs = [0, 0, 0, 0, 0]
+        self.pairs = [0, 0]
 
     @torch.no_grad()
     def forward(
@@ -179,7 +179,7 @@ class Block(nn.Module):
 
         n_1 = self.norm_1(x)
         h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
-        self.pairs[0], self.pairs[1] = self.attn.pairs[0], self.attn.pairs[1]
+        self.pairs[0] = self.attn.pairs
 
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
@@ -193,7 +193,7 @@ class Block(nn.Module):
             
             x = x + h
             x = x + self.mlp(self.norm_2(x))
-        self.pairs[2], self.pairs[3], self.pairs[4] = self.mlp.pairs[0], self.mlp.pairs[1], self.mlp.pairs[2]
+        self.pairs[1] = self.mlp.pairs
         return x, new_kv_cache
 
 
@@ -223,7 +223,7 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         qkv = self.attn(x)
-        self.pairs[0] = [x, qkv]
+        self.pairs[0] = x
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
@@ -280,7 +280,7 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         out = self.proj(y)
-        self.pairs[1] = [y, out]
+        self.pairs[1] = out
 
         return out, kv_cache
 
@@ -326,11 +326,11 @@ class LLaMAMLP(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.swiglu = SwiGLU(config)
-        self.pairs = [0, 0, 0]
+        self.pairs = [0, 0]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.swiglu(x)
-        self.pairs = self.swiglu.pairs
+        self.pairs[0], self.pairs[1] = x, out
         return out
 
 class SwiGLU(nn.Module):
@@ -339,18 +339,14 @@ class SwiGLU(nn.Module):
         self.w1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.w2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
-        self.pairs = [0, 0, 0]
         #self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
 
     @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fc_1 = self.w1(x)
-        self.pairs[0] = [x, x_fc_1]
         x_fc_2 = self.w2(x)
-        self.pairs[1] = [x, x_fc_2]
         x = torch.nn.functional.silu(x_fc_1) * x_fc_2
         y = self.w3(x)
-        self.pairs[2] = [x, y]
         return y
         #return self.swiglu(x)
 

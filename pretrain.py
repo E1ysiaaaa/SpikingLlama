@@ -29,11 +29,11 @@ name = "spiking-llama-1b"
 out_dir = Path("out") / name
 
 # Hyperparameters
-GPU_NUM = 8
+GPU_NUM = 6
 num_of_devices = GPU_NUM
-global_batch_size = GPU_NUM * 4 * 1   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
+global_batch_size = GPU_NUM * 3 * 1   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
 learning_rate = 4e-4
-micro_batch_size = 4
+micro_batch_size = 3
 max_step = 40000 * 2
 warmup_steps = 2000
 log_step_interval = 10
@@ -128,9 +128,10 @@ def main(fabric, train_data_dir, val_data_dir, resume):
         torch_model = QuantGPT(config)
         torch_model.apply(partial(torch_model._init_weights ,n_layer=config.n_layer))
         teacher = GPT(config)
-        checkpoint = torch.load(out_dir / "teacher.pth")
+        checkpoint = torch.load("out/teacher.pth")
         teacher.load_state_dict(checkpoint, strict=False)
-        torch_model.load_state_dict(checkpoint, strict=False)
+        student_ckpt = torch.load("out/with_norm.pth")
+        torch_model.load_state_dict(student_ckpt['model'], strict=False)
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters {num_parameters(torch_model):,}")
@@ -221,19 +222,17 @@ def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, res
         is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
         mu = 0.7
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            # get all the input and output of linear layers in block(layer)
-            pairs = teacher(input_ids, layer=1)
-            input_pairs = []
-            target_pairs = []
-            
-
-            for i in range(len(pairs)):
-                input_pairs.append(pairs[i][0].to(torch.float32))
-                target_pairs.append(pairs[i][1].to(torch.float32))
+            with torch.no_grad():
+                pairs = teacher(input_ids, layer=1)
+            input_pairs = [pairs[0][0], pairs[1][0]]
+            target_pairs = [pairs[0][1], pairs[1][1]]
+            #input_pairs = input_pairs.to(torch.bfloat16)
+            #target_pairs = target_pairs.to(torch.bfloat16)
 
             logits, mseloss = model(input_ids, input_pairs=input_pairs, target_pairs=target_pairs)
             # Consider the global and local loss
-            loss = mu * mseloss + (1-mu) * loss_func(logits, targets)
+            loss = loss_func(logits, targets)
+            #loss = mseloss
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)
 

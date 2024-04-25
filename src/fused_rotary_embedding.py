@@ -38,8 +38,6 @@ class ApplyRotaryEmb(torch.autograd.Function):
             )
         #print(x1.dtype)
         #print(cos.dtype)
-        # cos = cos.to(torch.float32)
-        # sin = sin.to(torch.float32)
         rotary_emb.apply_rotary(
             x1,
             x2,

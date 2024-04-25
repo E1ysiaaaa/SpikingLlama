@@ -9,56 +9,56 @@ from typing import Any, List, Optional, Tuple
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from math import pi
+from torch import sqrt
 from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
 from flash_attn import flash_attn_func
 from src.config import Config
-from xformers.ops import SwiGLU
+#from xformers.ops import SwiGLU
 from .fused_rotary_embedding import apply_rotary_emb_func
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
 
-def act_quantization(b):
-    def uniform_quant(x, b):
-        xdiv = x.mul(2 ** b - 1)
-        xhard = xdiv.round().div(2 ** b - 1)
-        return xhard
-    
+def act_heaveside(scale):
+    # Surrogate function f(x) = aH(x-b) = 2 / pi * a * arctan((x-b)*scale)
     class _uq(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, x, alpha):
-            x = x.div(alpha)
-            x_c = x.clamp(min=0, max=1)
-            x_q = uniform_quant(x_c, b)
-            ctx.save_for_backward(x, x_q)
-            x_q = x_q.mul(alpha)
-            return x_q
+        def forward(ctx, x, alpha, beta):
+            y = x - beta
+            positive = (y > 0).float()
+            negative = (y < 0).float()
+            out = alpha * (positive - negative)
+            ctx.save_for_backward(y, alpha)
+            return out.to(x.dtype)
 
         @staticmethod
         def backward(ctx, grad_output):
             grad_input = grad_output.clone()
-            x, x_q = ctx.saved_tensors
-            i = (x > 1).float()
-            grad_alpha = (grad_output * (i + (x_q - x) * (1 - i))).sum()
-            grad_input = grad_input * (1 - i)
-            return grad_input, grad_alpha
+            y, alpha = ctx.saved_tensors
+            alpha_d = 2 / pi * torch.arctan(y)
+            grad_alpha = alpha_d * grad_input
+            arctan_d = 2 / pi * scale / torch.sqrt((scale * y) ** 2 + 1)
+            grad_beta = -alpha * arctan_d * grad_input
+            grad_input = alpha * arctan_d * grad_input
+            return grad_input.to(grad_output.dtype), grad_alpha.to(grad_output.dtype), grad_beta.to(grad_output.dtype)
 
     return _uq().apply
 
-class QuantReLU(nn.ReLU):
-    def __init__(self, bit=4):
+class ParamHeavside(nn.Module):
+    def __init__(self, size):
         super().__init__()
-        self.bit = bit
-        self.act_alq = act_quantization(self.bit)
-        self.act_alpha = torch.nn.Parameter(torch.tensor(8.0))
+        self.zero_point = torch.nn.Parameter(torch.zeros([size]))
+        self.scale = torch.nn.Parameter(torch.ones([size]))
+        self.heaveside = act_heaveside(4.0)
 
-    def forward(self, x):
-        x = F.relu(x)
-        if self.bit < 16:
-            return self.act_alq(x, self.act_alpha)
+    def forward(self, x, infer=False):
+        seq_len = x.shape[-1]
+        if not infer:
+            return self.heaveside(x, self.scale, self.zero_point)
         else:
-            return x.clamp(min=0, max=self.act_alpha.item())
+            return self.heaveside(x, self.scale[:seq_len], self.zero_point[:seq_len])
 
 class AutoEncoder(nn.Module):
     def __init__(self, in_size, out_size):
@@ -68,25 +68,33 @@ class AutoEncoder(nn.Module):
         self.linear1 = nn.Linear(self.in_size, self.in_size // 2, bias=False)
         self.linear2 = nn.Linear(self.in_size // 2, self.out_size, bias=False)
         self.act1 = nn.ReLU()
-        self.act2 = QuantReLU()
+        self.act2 = ParamHeavside(self.out_size)
 
-    def forward(self, x):
-        out = self.act1(self.linear1(x))
-        out = self.act2(self.linear2(out))
+    def forward(self, x, infer=False):
+        if not infer:
+            out = self.act1(self.linear1(x))
+            out = self.act2(self.linear2(out))
+        else:
+            seq_len = x.shape[-1]
+            out = F.linear(x, self.linear1.weight[:, :seq_len])
+            out = self.act1(out)
+            out = F.linear(out, self.linear2.weight[:seq_len, :])
+            out = self.act2(out,infer=True)
         return out
 
 class QuantGPT(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, layer=1) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
+        self.layer = layer
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
-                ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
+                h=nn.ModuleList(Block(config, quant=True) if i == layer-1 else Block(config)  for i in range(config.n_layer)),
+                ln_f=RMSNorm(config.n_embd, eps=config.norm_eps),
             )
         )
         self.rope_cache: Optional[RoPECache] = None
@@ -118,9 +126,10 @@ class QuantGPT(nn.Module):
             self.mask_cache = None
 
     def forward(
-        self, idx: torch.Tensor, layer = 1, input_pairs = None, target_pairs = None, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
+        self, idx: torch.Tensor, input_pairs = None, target_pairs = None, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         B, T = idx.size()
+        layer = self.layer
         use_kv_cache = input_pos is not None
 
         block_size = self.config.block_size
@@ -160,9 +169,11 @@ class QuantGPT(nn.Module):
             for i in range(layer-1):
                 x, *_ = self.transformer.h[i](x, (cos, sin), max_seq_length)
             if input_pairs is None:
-                x, *_ = self.transformer.h[layer-1](x, (cos, sin), max_seq_length, quant=True)
+                x, *_ = self.transformer.h[layer-1](x, (cos, sin), max_seq_length)
             else:
-                x, loss, *_ = self.transformer.h[layer-1](x, (cos, sin), max_seq_length, quant=True, input_pairs=input_pairs, target_pairs=target_pairs)
+                x, *_ = self.transformer.h[layer-1](x, (cos, sin), max_seq_length)
+                output_pairs, *_ = self.transformer.h[layer-1](input_pairs, (cos, sin), max_seq_length)
+                loss = F.mse_loss(output_pairs, target_pairs)
             for i in range(layer, self.config.n_layer):
                 x, *_ = self.transformer.h[i](x, (cos, sin), max_seq_length)
             
@@ -186,7 +197,8 @@ class QuantGPT(nn.Module):
         return build_rope_cache(
             seq_len=self.config.block_size,
             n_elem=int(self.config.rotary_percentage * self.config.head_size),
-            dtype=torch.bfloat16,
+            #dtype=torch.bfloat16,
+            dtype=idx.dtype,
             device=idx.device,
             condense_ratio=self.config.condense_ratio,
         )
@@ -214,15 +226,18 @@ class QuantGPT(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, quant=False) -> None:
         super().__init__()
-        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.attn = CausalSelfAttention(config)
+        self.norm_1 = RMSNorm(config.n_embd, eps=config.norm_eps, quant=quant)
+        self.attn = CausalSelfAttention(config, quant)
         if not config.shared_attention_norm:
-            self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
+            self.norm_2 = RMSNorm(config.n_embd, eps=config.norm_eps, quant=quant)
         #self.mlp = config.mlp_class(config)
-        self.mlp = LLaMAMLP(config)
+        self.mlp = LLaMAMLP(config, quant)
         self.config = config
+        if not quant:
+            for param in self.parameters():
+                param.requires_grad = False
 
     def forward(
         self,
@@ -232,16 +247,11 @@ class Block(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
-        quant = False,
-        input_pairs = None, 
-        target_pairs = None
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
 
         n_1 = self.norm_1(x)
-        if input_pairs is None:
-            h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache, quant=quant)
-        else:
-            h, loss, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache, quant, input_pairs, target_pairs)
+        h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
+
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
             x = x + h + self.mlp(n_2)
@@ -253,28 +263,25 @@ class Block(nn.Module):
                 )
             
             x = x + h
-            if input_pairs is None:
-                x = x + self.mlp(self.norm_2(x), quant=quant)
-            else:
-                y, loss = self.mlp(self.norm_2(x), quant, input_pairs, target_pairs)
-                x = x + y
+            x = x + self.mlp(self.norm_2(x))
 
-        if input_pairs is None:
-            return x, new_kv_cache
-        else:
-            return x, loss, new_kv_cache
+        return x, new_kv_cache
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, quant=False) -> None:
         super().__init__()
+        self.quant = quant
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
-        self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
+
+        if self.quant:
+            self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
+            self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
+            self.softmax_encoder = AutoEncoder(config.block_size, config.block_size)
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
-        self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
 
         self.config = config
 
@@ -286,21 +293,14 @@ class CausalSelfAttention(nn.Module):
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
-        quant = False,
-        input_pairs = None,
-        target_pairs = None
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
         loss = 0
-        mu = 0.3
+        mu = 0.25
 
-        if quant:
+        if self.quant:
             x = self.encoder1(x)
         qkv = self.attn(x)
-        if input_pairs is not None:
-            x_quant = self.encoder1(input_pairs[0])
-            out_pair = self.attn(x_quant)
-            loss = loss + mu * F.mse_loss(x_quant, input_pairs[0]) + (1-mu) * F.mse_loss(out_pair, target_pairs[0])
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
@@ -356,19 +356,11 @@ class CausalSelfAttention(nn.Module):
         y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
-        if quant:
+        if self.quant:
             y = self.encoder2(y)
         y = self.proj(y)
 
-        if input_pairs is not None:
-            x_quant = self.encoder2(input_pairs[1])
-            out_pair = self.proj(x_quant)
-            loss = loss + mu * F.mse_loss(x_quant, input_pairs[1]) + (1-mu) * F.mse_loss(out_pair, target_pairs[1])
-
-        if input_pairs is None:
-            return y, kv_cache
-        else:
-            return y, loss, kv_cache
+        return y, kv_cache
 
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -390,9 +382,28 @@ class CausalSelfAttention(nn.Module):
         if q.size() != k.size():
              k = k.repeat_interleave(q.shape[1]//k.shape[1], dim=1)
              v = v.repeat_interleave(q.shape[1]//v.shape[1], dim=1)
-        y = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=mask, dropout_p=0.0, scale=scale, is_causal=mask is None
-        )
+
+        L, S = q.size(-2), k.size(-2)
+        scale_factor = 1 / math.sqrt(q.size(-1)) if scale is None else scale
+        attn_bias = torch.zeros(L, S, dtype=q.dtype, device=q.device)
+        if mask is None:
+            temp_mask = torch.ones(L, S, dtype=torch.bool, device=q.device).tril(diagonal=0)
+            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
+            attn_bias.to(q.dtype)
+        else:
+            if mask.dtype == torch.bool:
+                mask.masked_fill_(mask.logical_not(), float("-inf"))
+            else:
+                attn_bias += mask
+        attn_weight = q @ k.transpose(-2, -1) * scale_factor
+        attn_weight += attn_bias
+        if self.quant:
+            attn_weight = self.softmax_encoder(attn_weight, infer=True)
+            #attn_weight = torch.softmax(attn_weight, dim=-1)
+        else:
+            attn_weight = torch.softmax(attn_weight, dim=-1)
+        attn_weight = torch.dropout(attn_weight, 0.0, train=True)
+        y = attn_weight @ v
         return y.transpose(1, 2)
 
 
@@ -407,51 +418,71 @@ class GptNeoxMLP(nn.Module):
         x = torch.nn.functional.gelu(x)
         return self.proj(x)
 
-
 class LLaMAMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, quant=False):
         super().__init__()
-        self.fc_1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
-        self.fc_2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
-        self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
-        self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
-        self.encoder3 = AutoEncoder(config.intermediate_size, config.intermediate_size)
+        self.swiglu = SwiGLU(config, quant)
+
+    def forward(self, x):
+        return self.swiglu(x)
+
+class SwiGLU(nn.Module):
+    def __init__(self, config: Config, quant=False) -> None:
+        super().__init__()
+        self.quant = quant
+        if self.quant:
+            self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
+            self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
+            self.encoder3 = AutoEncoder(config.intermediate_size, config.intermediate_size)
+        self.w1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        self.w2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         #self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
-    def forward(self, x: torch.Tensor, quant=False, input_pairs=None, target_pairs=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         loss = 0
         mu = 0.8
-        if quant:
+        if self.quant:
             x1 = self.encoder1(x)
             x2 = self.encoder2(x)
         else:
             x1 = x2 = x
-        x_fc_1 = self.fc_1(x1)
-        x_fc_2 = self.fc_2(x2)
-        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
-        if quant:
-            x = self.encoder3(x)
-        y = self.proj(x)
-
-        if input_pairs is not None:
-            x_quant = self.encoder1(input_pairs[2])
-            out_pair = self.fc_1(x_quant)
-            loss = loss + mu * F.mse_loss(x_quant, input_pairs[2]) + (1-mu) * F.mse_loss(out_pair, target_pairs[2])
-        if input_pairs is not None:
-            x_quant = self.encoder2(input_pairs[3])
-            out_pair = self.fc_2(x_quant)
-            loss = loss + mu * F.mse_loss(x_quant, input_pairs[3]) + (1-mu) * F.mse_loss(out_pair, target_pairs[3])
-        if input_pairs is not None:
-            x_quant = self.encoder3(input_pairs[4])
-            out_pair = self.proj(x_quant)
-            loss = loss + mu * F.mse_loss(x_quant, input_pairs[4]) + (1-mu) * F.mse_loss(out_pair, target_pairs[4])
-            
-        if input_pairs is None:
-            return y
+        x_fc_1 = self.w1(x1)
+        x_fc_2 = self.w2(x2)
+        if self.quant:
+            x = torch.nn.functional.relu(x_fc_1) * x_fc_2
         else:
-            return y, loss
-        #return self.swiglu(x)
+            x = torch.nn.functional.silu(x_fc_1) * x_fc_2
+        if self.quant: 
+            x = self.encoder3(x)
+        y = self.w3(x)
 
+        return y
+
+class RMSNorm(torch.nn.Module):
+    """Root Mean Square Layer Normalization.
+
+    Derived from https://github.com/bzhangGo/rmsnorm/blob/master/rmsnorm_torch.py. BSD 3-Clause License:
+    https://github.com/bzhangGo/rmsnorm/blob/master/LICENSE.
+    """
+
+    def __init__(self, size: int, dim: int = -1, eps: float = 1e-5, quant=False) -> None:
+        super().__init__()
+        self.weight = torch.nn.Parameter(torch.ones(size))
+        self.eps = eps
+        self.dim = dim
+        self.quant = quant
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # NOTE: the original RMSNorm paper implementation is not equivalent
+        if not self.quant:
+            norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
+            x_normed = x * torch.rsqrt(norm_x + self.eps)
+        else:
+            x_normed = x
+        return self.weight * x_normed
+
+    def reset_parameters(self):
+        torch.nn.init.ones_(self.weight)
 
 def build_rope_cache(
     seq_len: int, n_elem: int, dtype: torch.dtype, device: torch.device, base: int = 10000, condense_ratio: int = 1

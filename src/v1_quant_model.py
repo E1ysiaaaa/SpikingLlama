@@ -28,7 +28,8 @@ def act_heaveside(scale):
         def forward(ctx, x, alpha, beta):
             y = x - beta
             positive = (y > 0).float()
-            out = alpha * positive
+            negative = (y < 0).float()
+            out = alpha * (positive - negative)
             ctx.save_for_backward(y, alpha)
             return out.to(x.dtype)
 
@@ -36,28 +37,42 @@ def act_heaveside(scale):
         def backward(ctx, grad_output):
             grad_input = grad_output.clone()
             y, alpha = ctx.saved_tensors
-            alpha_d = 1 / pi * torch.arctan(y) + 1 / 2
+            alpha_d = 2 / pi * torch.arctan(y)
             grad_alpha = alpha_d * grad_input
-            arctan_d = 1 / pi * scale / torch.sqrt((scale * y) ** 2 + 1)
+            arctan_d = 2 / pi * scale / torch.sqrt((scale * y) ** 2 + 1)
             grad_beta = -alpha * arctan_d * grad_input
             grad_input = alpha * arctan_d * grad_input
             return grad_input.to(grad_output.dtype), grad_alpha.to(grad_output.dtype), grad_beta.to(grad_output.dtype)
 
     return _uq().apply
 
-class ParamHeaveside(nn.Module):
+class ParamHeavside(nn.Module):
     def __init__(self, size):
         super().__init__()
         self.zero_point = torch.nn.Parameter(torch.zeros([size]))
         self.scale = torch.nn.Parameter(torch.ones([size]))
         self.heaveside = act_heaveside(4.0)
 
-    def forward(self, x, infer=True):
+    def forward(self, x):
+        return self.heaveside(x, self.scale, self.zero_point)
+
+class AutoEncoder(nn.Module):
+    def __init__(self, in_size, out_size):
+        super().__init__()
+        self.in_size = in_size
+        self.out_size = out_size
+        self.linear1 = nn.Linear(self.in_size, self.in_size // 2, bias=False)
+        self.linear2 = nn.Linear(self.in_size // 2, self.out_size, bias=False)
+        self.act1 = nn.ReLU()
+        self.act2 = ParamHeavside(self.out_size)
+
+    def forward(self, x, infer=False):
         if not infer:
-            return self.heaveside(x, self.scale, self.zero_point)
+            out = self.act1(self.linear1(x))
+            out = self.act2(self.linear2(out))
         else:
             seq_len = x.shape[-1]
-            return self.heaveside(x, self.scale[:seq_len], self.zero_point[:seq_len])
+        return out
 
 class QuantGPT(nn.Module):
     def __init__(self, config: Config, layer=1) -> None:
@@ -203,16 +218,10 @@ class QuantGPT(nn.Module):
 class Block(nn.Module):
     def __init__(self, config: Config, quant=False) -> None:
         super().__init__()
-        if not quant:
-            self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        else:
-            self.norm_1 = MyNorm(config.n_embd, eps=config.norm_eps)
+        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
         self.attn = CausalSelfAttention(config, quant)
         if not config.shared_attention_norm:
-            if not quant:
-                self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
-            else:
-                self.norm_2 = MyNorm(config.n_embd, eps=config.norm_eps)
+            self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
         #self.mlp = config.mlp_class(config)
         self.mlp = LLaMAMLP(config, quant)
         self.config = config
@@ -236,16 +245,7 @@ class Block(nn.Module):
         if input_pairs is None:
             h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
         else:
-            h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
-            out_pairs, *_ = self.attn(input_pairs[0], rope, max_seq_length, mask, input_pos, kv_cache)
-            ''' Bullshit KLDivLoss
-            kd_loss = nn.KLDivLoss(reduction="batchmean")
-            out_pairs = F.log_softmax(out_pairs, dim=-1)
-            true_pairs = F.softmax(target_pairs[0], dim=-1)
-            loss1 = kd_loss(out_pairs, true_pairs)
-            '''
-            loss1 = F.mse_loss(out_pairs, target_pairs[0])
-
+            h, loss, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache, input_pairs, target_pairs)
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
             x = x + h + self.mlp(n_2)
@@ -260,15 +260,13 @@ class Block(nn.Module):
             if input_pairs is None:
                 x = x + self.mlp(self.norm_2(x))
             else:
-                y, loss2 = self.mlp(self.norm_2(x), input_pairs, target_pairs)
+                y, loss = self.mlp(self.norm_2(x), input_pairs, target_pairs)
                 x = x + y
 
         if input_pairs is None:
             return x, new_kv_cache
         else:
-            #print(f"loss1 = {loss1.item()}")
-            #print(f"loss2 = {loss2.item()}")
-            return x, loss1 + loss2, new_kv_cache
+            return x, loss, new_kv_cache
 
 
 class CausalSelfAttention(nn.Module):
@@ -280,8 +278,8 @@ class CausalSelfAttention(nn.Module):
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
 
         if self.quant:
-            self.encoder1 = ParamHeaveside(config.n_embd)
-            self.attn_encoder = ParamHeaveside(config.block_size)
+            self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
+            self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
             #self.softmax_encoder = AutoEncoder(config.block_size, config.block_size)
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -295,13 +293,22 @@ class CausalSelfAttention(nn.Module):
         max_seq_length: int,
         mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
-        kv_cache: Optional[KVCache] = None
+        kv_cache: Optional[KVCache] = None,
+        input_pairs = None,
+        target_pairs = None
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
+        loss = 0
+        mu = 0.25
 
         if self.quant:
             x = self.encoder1(x)
         qkv = self.attn(x)
+        if input_pairs is not None:
+            x_quant = self.encoder1(input_pairs[0])
+            out_pair = self.attn(x_quant)
+            #loss = loss + mu * F.mse_loss(x_quant, input_pairs[0]) + (1-2*mu) * F.mse_loss(out_pair, target_pairs[0]) + mu * F.mse_loss(self.attn)
+            loss = loss + F.mse_loss(out_pair, target_pairs[0])
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
@@ -357,9 +364,20 @@ class CausalSelfAttention(nn.Module):
         y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
+        if self.quant:
+            y = self.encoder2(y)
         y = self.proj(y)
 
-        return y, kv_cache
+        if input_pairs is not None:
+            x_quant = self.encoder2(input_pairs[1])
+            out_pair = self.proj(x_quant)
+            #loss = loss + mu * F.mse_loss(x_quant, input_pairs[1]) + (1-mu) * F.mse_loss(out_pair, target_pairs[1])        
+            loss = loss + F.mse_loss(out_pair, target_pairs[1])
+
+        if input_pairs is None:
+            return y, kv_cache
+        else:
+            return y, loss, kv_cache
 
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
@@ -397,7 +415,8 @@ class CausalSelfAttention(nn.Module):
         attn_weight = q @ k.transpose(-2, -1) * scale_factor
         attn_weight += attn_bias
         if self.quant:
-            attn_weight = self.attn_encoder(attn_weight) / L
+            #attn_weight = self.softmax_encoder(attn_weight)
+            attn_weight = torch.softmax(attn_weight, dim=-1)
         else:
             attn_weight = torch.softmax(attn_weight, dim=-1)
         attn_weight = torch.dropout(attn_weight, 0.0, train=True)
@@ -422,34 +441,23 @@ class LLaMAMLP(nn.Module):
         self.swiglu = SwiGLU(config, quant)
 
     def forward(self, x, input_pairs=None, target_pairs=None):
-        if input_pairs is None:
-            return self.swiglu(x)
-        else:
-            output = self.swiglu(x)
-            out_pairs = self.swiglu(input_pairs[1])
-            '''
-            kd_loss = nn.KLDivLoss(reduction="batchmean")
-            out_pairs = F.log_softmax(out_pairs, dim=-1)
-            true_pairs = F.softmax(target_pairs[1], dim=-1)
-            loss = kd_loss(out_pairs, true_pairs)
-            '''
-            loss = F.mse_loss(out_pairs, target_pairs[1])
-            return output, loss
+        return self.swiglu(x, input_pairs, target_pairs)
 
 class SwiGLU(nn.Module):
     def __init__(self, config: Config, quant=False) -> None:
         super().__init__()
         self.quant = quant
         if self.quant:
-            self.encoder1 = ParamHeaveside(config.n_embd)
-            self.encoder2 = ParamHeaveside(config.n_embd)
-            self.encoder3 = ParamHeaveside(config.intermediate_size)
-            self.encoder4 = ParamHeaveside(config.intermediate_size)
+            self.encoder1 = AutoEncoder(config.n_embd, config.n_embd)
+            self.encoder2 = AutoEncoder(config.n_embd, config.n_embd)
+            self.encoder3 = AutoEncoder(config.intermediate_size, config.intermediate_size)
         self.w1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.w2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         #self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
-    def forward(self, x: torch.Tensor, target_pairs=None) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, input_pairs=None, target_pairs=None) -> torch.Tensor:
+        loss = 0
+        mu = 0.8
         if self.quant:
             x1 = self.encoder1(x)
             x2 = self.encoder2(x)
@@ -457,15 +465,31 @@ class SwiGLU(nn.Module):
             x1 = x2 = x
         x_fc_1 = self.w1(x1)
         x_fc_2 = self.w2(x2)
+        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
         if self.quant:
-            x = self.encoder3(x_fc_1) * x_fc_2
-        else:
-            x = torch.nn.functional.silu(x_fc_1) * x_fc_2
-        if self.quant:
-            x = self.encoder4(x)
+            x = self.encoder3(x)
         y = self.w3(x)
 
-        return y
+        if input_pairs is not None:
+            x_quant = self.encoder1(input_pairs[2])
+            out_pair = self.w1(x_quant)
+            #loss = loss + mu * F.mse_loss(x_quant, input_pairs[2]) + (1-mu) * F.mse_loss(out_pair, target_pairs[2])
+            loss = loss + F.mse_loss(out_pair, target_pairs[2])
+        if input_pairs is not None:
+            x_quant = self.encoder2(input_pairs[3])
+            out_pair = self.w2(x_quant)
+            #loss = loss + mu * F.mse_loss(x_quant, input_pairs[3]) + (1-mu) * F.mse_loss(out_pair, target_pairs[3])
+            loss = loss + F.mse_loss(out_pair, target_pairs[3])
+        if input_pairs is not None:
+            x_quant = self.encoder3(input_pairs[4])
+            out_pair = self.w3(x_quant)
+            #loss = loss + mu * F.mse_loss(x_quant, input_pairs[4]) + (1-mu) * F.mse_loss(out_pair, target_pairs[4])
+            loss = loss + F.mse_loss(out_pair, target_pairs[4])
+            
+        if input_pairs is None:
+            return y
+        else:
+            return y, loss
         #return self.swiglu(x)
 
 
@@ -505,27 +529,3 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     rotated = torch.cat((-x2, x1), dim=-1)  # (B, nh, T, hs)
     roped = (x * cos) + (rotated * sin)
     return roped.type_as(x)
-
-class MyNorm(nn.Module):
-    """
-    Derived from https://github.com/bzhangGo/rmsnorm/blob/master/rmsnorm_torch.py. BSD 3-Clause License:
-    https://github.com/bzhangGo/rmsnorm/blob/master/LICENSE.
-    """
-
-    def __init__(self, size: int, dim: int = -1, eps: float = 1e-5) -> None:
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(size))
-        self.eps = eps
-        self.dim = dim
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # NOTE: the original RMSNorm paper implementation is not equivalent
-        norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
-        x_normed = x * torch.rsqrt(norm_x + self.eps)
-        #x_normed = x
-        #D = x.shape[-1]
-        #return self.weight * x_normed / (D ** 0.5)
-        return self.weight * x_normed
-
-    def reset_parameters(self):
-        torch.nn.init.ones_(self.weight)
