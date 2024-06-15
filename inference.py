@@ -7,8 +7,18 @@ from src.quant_model import QuantGPT
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple, TypedDict
 import torch
+import matplotlib.pyplot as plt
+import numpy as np
 
+class Hook:
+    def __init__(self):
+        self.input = None
+        self.output = None
 
+    def hook_fn(self, module, input, output):
+        with torch.no_grad():
+            self.output = output[0]
+            self.input = input[0]
 
 @torch.inference_mode()
 def generate(
@@ -68,24 +78,42 @@ def sample_top_p(probs, p):
     next_token = torch.gather(probs_idx, -1, next_token)
     return next_token
 
+def print_dist(x: torch.Tensor, num):
+    bins = 500
+    with torch.no_grad():
+        x = x.flatten()
+        print(x.shape[0])
+        v_min = x.min().item()
+        v_max = x.max().item()
+        hist = x.cpu().numpy()
+        t = np.linspace(v_min, v_max, bins)
+        plt.hist(hist, align='mid', bins=t, density=True)
+        plt.savefig('figures/'+str(num)+'.png')
+
 def main():
+    torch.manual_seed(0)
     model_name = "tiny_LLaMA_1b"
-    checkpoint_path = "out/teacher.pth"
-    #checkpoint_path = "out/spiking-llama-1b/teacher.pth"
+    checkpoint_path = "/data1/SpikingLlama/168.pth"
+    #checkpoint_path = "out/teacher.pth"
     tokenizer_path = Path("checkpoints/")
     tokenizer = Tokenizer(tokenizer_path)
     config = Config.from_name(model_name)
-    model = GPT(config).to("cuda")
+    model = QuantGPT(config).to("cuda")
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint, strict=False)
+    hook = Hook()
+    model.transformer.h[0].attn.register_forward_hook(hook.hook_fn)
 
-    input_text = "Hello, I am"
-    max_gen_len = 20
+    input_text = "Hello, I am a freshman and I want to know where I can buy "
+    max_gen_len = 1
     input_tokens = tokenizer.encode(input_text)
     prompt_tokens = input_tokens[:-1]
     out_tokens = generate(model, tokenizer, prompt_tokens, max_gen_len)
     out_text = tokenizer.decode(torch.tensor(out_tokens[0]))
     print(out_text)
+    
+    print_dist(hook.output, '168_attn_output')
+    print_dist(hook.input, '168_attn_input')
 
 if __name__ == "__main__":
     main()

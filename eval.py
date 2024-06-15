@@ -55,7 +55,7 @@ class SpikeLlamaWrapper(HFLM):
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
 
     # change you checkpoint path here (pretrained)
-    def __init__(self, pretrained="out/spiking-llama-1b/iter-001000-ckpt.pth", max_length=512, batch_size=None, device="cuda",
+    def __init__(self, pretrained="/data1/SpikingLlama/178.pth", max_length=512, batch_size=None, device="cuda",
                  dtype=torch.float32):
         LM.__init__(self)
         self._model = SpikeGPTFull(pretrained).to(device=device, dtype=dtype)
@@ -63,6 +63,8 @@ class SpikeLlamaWrapper(HFLM):
         self.tokenizer = AutoTokenizer.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
         self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
         self.vocab_size = self.tokenizer.vocab_size
+        self.add_bos_token = False
+        self.logits_cache = False
 
         self._batch_size = int(batch_size) if batch_size is not None else 64
         self._max_length = max_length

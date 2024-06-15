@@ -8,139 +8,31 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from math import pi
-from torch import sqrt
 from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
 from flash_attn import flash_attn_func
 from src.config import Config
 #from xformers.ops import SwiGLU
+from transformers.utils import is_torch_bf16_gpu_available
 from .fused_rotary_embedding import apply_rotary_emb_func
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
-#FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
+FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
 
-def act_quantization(b):
-    def uniform_quant(x, b):
-        xdiv = x.mul(2 ** b - 1)
-        xhard = xdiv.round().div(2 ** b - 1)
-        return xhard
-
-    class _uq(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, x, alpha):
-            x = x.div(alpha)
-            x_c = x.clamp(min=0, max=1)
-            x_q = uniform_quant(x_c, b)
-            ctx.save_for_backward(x, x_q)
-            x_q = x_q.mul(alpha)
-            return x_q
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            grad_input = grad_output.clone()
-            x, x_q = ctx.saved_tensors
-            i = (x > 1).float()
-            grad_alpha = (grad_output * (i + (x_q - x) * (1 - i))).sum()
-            grad_input = grad_input * (1 - i)
-            return grad_input, grad_alpha
-
-    return _uq().apply
-
-class QuantReLU(nn.ReLU):
-    def __init__(self):
-        super().__init__()
-        self.bit = 4
-        self.act_alq = act_quantization(self.bit)
-        self.act_alpha = torch.nn.Parameter(torch.tensor(8.0))
-
-    def forward(self, x):
-        x = F.relu(x)
-        return self.act_alq(x, self.act_alpha)
-
-def act_heaveside(scale):
-    # Surrogate function f(x) = aH(x-b) = 2 / pi * a * arctan((x-b)*scale)
-    class _uq(torch.autograd.Function):
-        @staticmethod
-        def forward(ctx, x, alpha, beta):
-            y = x - beta
-            positive = (y > 0).float()
-            out = alpha * positive
-            ctx.save_for_backward(y, alpha)
-            return out.to(x.dtype)
-
-        @staticmethod
-        def backward(ctx, grad_output):
-            grad_input = grad_output.clone()
-            y, alpha = ctx.saved_tensors
-            alpha_d = 1 / pi * torch.arctan(y) + 1 / 2
-            grad_alpha = alpha_d * grad_input
-            arctan_d = 1 / pi * scale / torch.sqrt((scale * y) ** 2 + 1)
-            grad_beta = -alpha * arctan_d * grad_input
-            grad_input = alpha * arctan_d * grad_input
-            return grad_input.to(grad_output.dtype), grad_alpha.to(grad_output.dtype), grad_beta.to(grad_output.dtype)
-
-    return _uq().apply
-
-class ParamHeaveside(nn.Module):
-    def __init__(self, size, normed=False):
-        super().__init__()
-        self.normed = normed
-        self.zero_point = torch.nn.Parameter(torch.zeros([size]))
-        self.scale = torch.nn.Parameter(torch.ones([size]))
-        self.heaveside = act_heaveside(4.0)
-
-    def forward(self, x, infer=False):
-        if not infer:
-            if self.normed:
-                shape = x.shape
-                x = x.flatten(end_dim=-2)
-                x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
-                x = x.reshape(*shape)
-            return self.heaveside(x, self.scale, self.zero_point)
-        else:
-            if self.normed:
-                shape = x.shape
-                x = x.flatten(end_dim=-2)
-                x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
-                x = x.reshape(*shape)
-            seq_len = x.shape[-1]
-            return self.heaveside(x, self.scale[:seq_len], self.zero_point[:seq_len])
-
-class QuantGPT(nn.Module):
-    def __init__(self, config: Config, layer=[1, 2]) -> None:
+class GPT(nn.Module):
+    def __init__(self, config: Config) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
-        self.layer = layer
 
         self.lm_head = nn.Linear(config.n_embd, config.padded_vocab_size, bias=False)
-        mlist = nn.ModuleList()
-        for i in range(config.n_layer):
-            if i+1 == layer[-1]:
-                mlist.append(Block(config, quant=True, grad_on=True))
-            elif i+1 in layer:
-                mlist.append(Block(config, quant=True))
-            else:
-                mlist.append(Block(config))
-
         self.transformer = nn.ModuleDict(
             dict(
                 wte=nn.Embedding(config.padded_vocab_size, config.n_embd),
-                h=mlist,
+                h=nn.ModuleList(Block(config) for _ in range(config.n_layer)),
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
-        #'''
-        for param in self.transformer.wte.parameters():
-            param.requires_grad = False
-        for param in self.transformer.ln_f.parameters():
-            param.requires_grad = False
-        for param in self.lm_head.parameters():
-            param.requires_grad = False
-        #'''
-
         self.rope_cache: Optional[RoPECache] = None
         self.mask_cache: Optional[torch.Tensor] = None
         self.kv_caches: List[KVCache] = []
@@ -169,11 +61,11 @@ class QuantGPT(nn.Module):
             self.rope_cache = None
             self.mask_cache = None
 
+    @torch.no_grad()
     def forward(
-        self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
+        self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None, layer = None
     ) -> torch.Tensor:
         B, T = idx.size()
-        layer = self.layer
         use_kv_cache = input_pos is not None
 
         block_size = self.config.block_size
@@ -208,23 +100,20 @@ class QuantGPT(nn.Module):
 
         # forward the model itself
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
-        loss = 0
-        if not use_kv_cache:
-            for i in layer:
-                x, *_ = self.transformer.h[i-1](x, (cos, sin), max_seq_length)
-                #print(x.flatten().abs().max().item())
-            for i in range(layer[-1], self.config.n_layer):
-                x, *_ = self.transformer.h[i](x, (cos, sin), max_seq_length)
-                #print(x.flatten().abs().max().item())
             
+        if not use_kv_cache:
+            if layer is None:
+                for block in self.transformer.h:
+                    x, *_ = block(x, (cos, sin), max_seq_length)
+            else:
+                for k in range(layer):
+                    x, *_ = self.transformer.h[k](x, (cos, sin), max_seq_length)
+                return self.transformer.h[layer-1].pairs
+
         else:
             self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length, cos.size(-1) * 2)
-            for i in layer:
-                x, self.kv_caches[i] = self.transformer.h[i-1](x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i])
-                #print(x.flatten().abs().max().item())
-            for i in range(layer[-1], self.config.n_layer):
-                x, self.kv_caches[i] = self.transformer.h[i](x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i])
-                #print(x.flatten().abs().max().item())
+            for i, block in enumerate(self.transformer.h):
+                x, self.kv_caches[i] = block(x, (cos, sin), max_seq_length, mask, input_pos, self.kv_caches[i])
 
         x = self.transformer.ln_f(x)
 
@@ -267,27 +156,17 @@ class QuantGPT(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config: Config, quant=False, grad_on=False) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.quant = quant
-        if not quant:
-            self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        else:
-            self.norm_1 = MyNorm(config.n_embd, eps=config.norm_eps)
-            #self.lora = Lora(config)
-        self.attn = CausalSelfAttention(config, quant)
+        self.norm_1 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.attn = CausalSelfAttention(config)
         if not config.shared_attention_norm:
-            if not quant:
-                self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
-            else:
-                self.norm_2 = MyNorm(config.n_embd, eps=config.norm_eps)
-        #self.mlp = config.mlp_class(config)
-        self.mlp = LLaMAMLP(config, quant)
+            self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
+        self.mlp = LLaMAMLP(config)
         self.config = config
-        if not grad_on:
-            for param in self.parameters():
-                param.requires_grad = False
+        self.pairs = [0, 0]
 
+    @torch.no_grad()
     def forward(
         self,
         x: torch.Tensor,
@@ -298,11 +177,9 @@ class Block(nn.Module):
         kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
 
-        #if self.quant:
-        #    addition = self.lora(x)
         n_1 = self.norm_1(x)
-        #print(f"device: {x.device}, max value = {n_1.flatten().abs().max().item()}")
         h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
+        self.pairs[0] = self.attn.pairs
 
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
@@ -316,45 +193,24 @@ class Block(nn.Module):
             
             x = x + h
             x = x + self.mlp(self.norm_2(x))
-
-        #if self.quant:
-        #    x = x + addition
-
+        self.pairs[1] = self.mlp.pairs
         return x, new_kv_cache
 
-class Lora(nn.Module):
-    def __init__(self, config):
-        super().__init__()
-        self.rank = 4
-        self.linear1 = nn.Linear(config.n_embd, self.rank, bias=False)
-        self.linear2 = nn.Linear(self.rank, config.n_embd, bias=False)
-        self.output = ParamHeaveside(config.n_embd)
-
-    def forward(self, x):
-        out = self.linear1(x)
-        out = self.linear2(out)
-        out = self.output(out)
-        return out
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config: Config, quant=False) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.quant = quant
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
-
-        if self.quant:
-            self.encoder1 = ParamHeaveside(config.n_embd)
-            #self.encoder1 = QuantReLU()
-            self.attn_encoder = ParamHeaveside(config.block_size, normed=True)
-            #self.attn_encoder = QuantReLU()
-            #self.softmax_encoder = AutoEncoder(config.block_size, config.block_size)
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
         self.config = config
 
+        self.pairs = [0, 0]
+
+    @torch.no_grad()
     def forward(
         self,
         x: torch.Tensor,
@@ -366,9 +222,8 @@ class CausalSelfAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
-        if self.quant:
-            x = self.encoder1(x)
         qkv = self.attn(x)
+        self.pairs[0] = x
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
@@ -424,15 +279,16 @@ class CausalSelfAttention(nn.Module):
         y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
-        y = self.proj(y)
+        out = self.proj(y)
+        self.pairs[1] = out
 
-        return y, kv_cache
+        return out, kv_cache
 
     def scaled_dot_product_attention(
         self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: Optional[torch.Tensor] = None
     ):
         scale = 1.0 / math.sqrt(self.config.head_size)
-        '''
+        
         if (
             FlashAttention2Available
             and mask is None
@@ -442,50 +298,22 @@ class CausalSelfAttention(nn.Module):
             from flash_attn import flash_attn_func
 
             return flash_attn_func(q, k, v, dropout_p=0.0, softmax_scale=scale, causal=True)
-        '''
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
         if q.size() != k.size():
              k = k.repeat_interleave(q.shape[1]//k.shape[1], dim=1)
              v = v.repeat_interleave(q.shape[1]//v.shape[1], dim=1)
-
-        L, S = q.size(-2), k.size(-2)
-        scale_factor = 1 / math.sqrt(q.size(-1)) if scale is None else scale
-        attn_bias = torch.zeros(L, S, dtype=q.dtype, device=q.device)
-        if mask is None:
-            temp_mask = torch.ones(L, S, dtype=torch.bool, device=q.device).tril(diagonal=0)
-            post_mask = temp_mask.float().to(q.dtype)
-            attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-            attn_bias.to(q.dtype)
-        else:
-            if mask.dtype == torch.bool:
-                post_mask = mask.float().to(q.dtype)
-                mask.masked_fill_(mask.logical_not(), float("-inf"))
-            else:
-                post_mask = torch.exp(mask)
-                attn_bias += mask
-        attn_weight = q @ k.transpose(-2, -1) * scale_factor
-
-        if self.quant:
-            attn_weight = attn_weight.transpose(-1, -2)
-            attn_weight = self.attn_encoder(attn_weight)
-            attn_weight = attn_weight.transpose(-2, -1)
-            attn_weight = torch.dropout(attn_weight, 0.0, train=True)
-            attn_weight = attn_weight * post_mask   # [B, H, S, S]
-            y = attn_weight @ v # [B, H, S, D_H]
-            return y.transpose(1, 2)
-        else:
-            attn_weight += attn_bias
-            attn_weight = torch.softmax(attn_weight, dim=-1)
-            attn_weight = torch.dropout(attn_weight, 0.0, train=True)
-            y = attn_weight @ v
-            return y.transpose(1, 2)
+        y = torch.nn.functional.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=mask is None
+        )
+        return y.transpose(1, 2)
 
 
 class GptNeoxMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, i) -> None:
         super().__init__()
+        self.idx = i
         self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
 
@@ -495,47 +323,30 @@ class GptNeoxMLP(nn.Module):
         return self.proj(x)
 
 class LLaMAMLP(nn.Module):
-    def __init__(self, config: Config, quant=False):
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.swiglu = SwiGLU(config, quant)
-        self.quant = quant
+        self.swiglu = SwiGLU(config)
+        self.pairs = [0, 0]
 
-    def forward(self, x):
-        return self.swiglu(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        out = self.swiglu(x)
+        self.pairs[0], self.pairs[1] = x, out
+        return out
 
 class SwiGLU(nn.Module):
-    def __init__(self, config: Config, quant=False) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.quant = quant
-        if self.quant:
-            self.encoder1 = ParamHeaveside(config.n_embd)
-            #self.encoder1 = QuantReLU()
-            self.encoder2 = ParamHeaveside(config.n_embd)
-            #self.encoder2 = QuantReLU()
-            self.encoder3 = ParamHeaveside(config.intermediate_size)
-            #self.encoder3 = QuantReLU()
-            self.encoder4 = ParamHeaveside(config.intermediate_size, normed=True)
-            #self.encoder4 = QuantReLU()
         self.w1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.w2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         #self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.quant:
-            x1 = self.encoder1(x)
-            x2 = self.encoder2(x)
-        else:
-            x1 = x2 = x
-        x_fc_1 = self.w1(x1)
-        x_fc_2 = self.w2(x2)
-        if self.quant:
-            x = self.encoder3(x_fc_1) * x_fc_2
-        else:
-            x = torch.nn.functional.silu(x_fc_1) * x_fc_2
-        if self.quant:
-            x = self.encoder4(x)
-        y = self.w3(x)
 
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_fc_1 = self.w1(x)
+        x_fc_2 = self.w2(x)
+        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
+        y = self.w3(x)
         return y
         #return self.swiglu(x)
 
@@ -576,28 +387,3 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     rotated = torch.cat((-x2, x1), dim=-1)  # (B, nh, T, hs)
     roped = (x * cos) + (rotated * sin)
     return roped.type_as(x)
-
-class MyNorm(nn.Module):
-    """
-    Derived from https://github.com/bzhangGo/rmsnorm/blob/master/rmsnorm_torch.py. BSD 3-Clause License:
-    https://github.com/bzhangGo/rmsnorm/blob/master/LICENSE.
-    """
-
-    def __init__(self, size: int, dim: int = -1, eps: float = 1e-5) -> None:
-        super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(size))
-        self.eps = eps
-        self.dim = dim
-        self.size = size
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # NOTE: the original RMSNorm paper implementation is not equivalent
-        norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
-        x_normed = x * torch.rsqrt(norm_x + self.eps)
-        #x_normed = x
-        #D = self.size
-        #return self.weight * x_normed / (D ** 0.5)
-        return self.weight * x_normed
-
-    def reset_parameters(self):
-        torch.nn.init.ones_(self.weight)

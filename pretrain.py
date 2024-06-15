@@ -7,7 +7,7 @@ from typing import Optional, Tuple, Union
 import math
 import lightning as L
 import torch
-from lightning.fabric.strategies import FSDPStrategy, XLAStrategy, DeepSpeedStrategy
+from lightning.fabric.strategies import FSDPStrategy, XLAStrategy, DeepSpeedStrategy, DDPStrategy
 from torch.utils.data import DataLoader
 from functools import partial
 # support running without installing as a package
@@ -21,20 +21,27 @@ from src.speed_monitor import SpeedMonitorFabric as Monitor
 from src.speed_monitor import estimate_flops, measure_flops
 from src.utils import chunked_cross_entropy, get_default_supported_precision, num_parameters, step_csv_logger, lazy_load
 from src import FusedCrossEntropyLoss
+from src.hook import *
+#from src.grab_act import get_fea_by_hook, test_grad_vanish, remove_hook
 from pytorch_lightning.loggers import WandbLogger
 import random
 
+'''
+data stored in /data4/slim_star_combined
+checkpotins stored in /data1/SpikingLlama
+'''
+
 model_name = "tiny_LLaMA_1b"
 name = "spiking-llama-1b"
-out_dir = Path("out") / name
+out_dir = Path("/data1/SpikingLlama/out") / name
 
 # Hyperparameters
 GPU_NUM = 6
 num_of_devices = GPU_NUM
-global_batch_size = GPU_NUM * 3 * 1   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
+global_batch_size = GPU_NUM * 1 * 1   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
 learning_rate = 4e-4
-micro_batch_size = 3
-max_step = 40000 * 2
+micro_batch_size = 1
+max_step = 80000 * 3
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
@@ -85,13 +92,14 @@ def setup(
                 activation_checkpointing_policy=None,
                 state_dict_type="full",
                 limit_all_gathers=True,
+                sharding_strategy="NO_SHARD",
                 cpu_offload=False,
             )
             #strategy = DeepSpeedStrategy()
     else:
         strategy = "auto"
 
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=[logger, wandb_logger])
+    fabric = L.Fabric(devices=devices, strategy=DDPStrategy(), precision=precision, loggers=[logger, wandb_logger])
     fabric.print(hparams)
     #fabric.launch(main, train_data_dir, val_data_dir, resume)
     main(fabric, train_data_dir, val_data_dir, resume)
@@ -127,18 +135,15 @@ def main(fabric, train_data_dir, val_data_dir, resume):
     with fabric.init_module(empty_init=False):
         torch_model = QuantGPT(config)
         torch_model.apply(partial(torch_model._init_weights ,n_layer=config.n_layer))
-        teacher = GPT(config)
+        #checkpoint = torch.load("/data1/SpikingLlama/163.pth")
         checkpoint = torch.load("out/teacher.pth")
-        teacher.load_state_dict(checkpoint, strict=False)
-        student_ckpt = torch.load("out/with_norm.pth")
-        torch_model.load_state_dict(student_ckpt['model'], strict=False)
+        torch_model.load_state_dict(checkpoint, strict=False)
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters {num_parameters(torch_model):,}")
 
     model = fabric.setup(torch_model)
     #abstract_optimizer = torch.optim.AdamW([torch.zeros([1])], lr=learning_rate)
-    teacher = fabric.setup_module(teacher)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False
     )
@@ -157,15 +162,17 @@ def main(fabric, train_data_dir, val_data_dir, resume):
         state['optimizer'] = optimizer
 
     train_time = time.perf_counter()
-    train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, resume)
+    train(fabric, state, train_dataloader, val_dataloader, monitor, resume)
     fabric.print(f"Training time: {(time.perf_counter()-train_time):.2f}s")
     if fabric.device.type == "cuda":
         fabric.print(f"Memory used: {torch.cuda.max_memory_allocated() / 1e9:.02f} GB")
 
 # Training details here
-def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, resume):
+def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
     model = state["model"]
     optimizer = state["optimizer"]
+
+    #hooks = get_fea_by_hook(model, 'encoder')
 
     if val_dataloader is not None:
         validate(fabric, model, val_dataloader)  # sanity check
@@ -220,19 +227,17 @@ def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, res
         input_ids = train_data[:, 0 : model.config.block_size].contiguous()
         targets = train_data[:, 1 : model.config.block_size + 1].contiguous()
         is_accumulating = (state["iter_num"] + 1) % gradient_accumulation_steps != 0
-        mu = 0.7
+        mu = 0.00
         with fabric.no_backward_sync(model, enabled=is_accumulating):
-            with torch.no_grad():
-                pairs = teacher(input_ids, layer=1)
-            input_pairs = [pairs[0][0], pairs[1][0]]
-            target_pairs = [pairs[0][1], pairs[1][1]]
             #input_pairs = input_pairs.to(torch.bfloat16)
             #target_pairs = target_pairs.to(torch.bfloat16)
 
-            logits, mseloss = model(input_ids, input_pairs=input_pairs, target_pairs=target_pairs)
+            #logits, mseloss = model(input_ids, input_pairs=input_pairs, target_pairs=target_pairs)
+            logits = model(input_ids)
+            #print(logits.flatten().max())
             # Consider the global and local loss
-            loss = loss_func(logits, targets)
-            #loss = mseloss
+            global_loss = loss_func(logits, targets)
+            loss = global_loss
             # loss = chunked_cross_entropy(logits, targets, chunk_size=0)
             fabric.backward(loss / gradient_accumulation_steps)
 
@@ -254,6 +259,18 @@ def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, res
                 # print days as well
                 f" or {(t1 - total_t0) / (state['iter_num'] - initial_iter) * (max_iters - state['iter_num']) / 3600 / 24:.2f} days. "
             )
+
+        '''
+        zero_percent = {}
+        for name, hook in hooks.items():
+            fabric.print(
+                    f"--------------- {name} --------------------\n"
+                    f"output zero percentage: {hook.output: .3f}\n"
+                    f"grad in zero percentage: {hook.grad_in: .3f}\n"
+                    f"grad out grad zero percentage: {hook.grad_out: .3f}"
+                    )
+            zero_percent[name] = hook.output
+        '''
  
         monitor.on_train_batch_end(
             state["iter_num"] * micro_batch_size,
@@ -267,8 +284,6 @@ def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, res
         )
 
             
-            
-            
         if val_dataloader is not None and not is_accumulating and state["step_count"] % eval_step_interval == 0:
             
             t0 = time.perf_counter()
@@ -278,6 +293,8 @@ def train(fabric, teacher, state, train_dataloader, val_dataloader, monitor, res
             fabric.print(f"step {state['iter_num']}: val loss {val_loss:.4f}, val time: {t1 * 1000:.2f}ms")
             fabric.log_dict({"metric/val_loss": val_loss.item(), "total_tokens": model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size}, state["step_count"])
             fabric.log_dict({"metric/val_ppl": math.exp(val_loss.item()), "total_tokens": model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size}, state["step_count"])
+            #for name, value in zero_percent.items():
+            #    fabric.log_dict({"metric/"+name: value, "total_tokens": model.config.block_size * (state["iter_num"] + 1) * micro_batch_size * fabric.world_size}, state["step_count"])
             fabric.barrier()
         if not is_accumulating and state["step_count"] % save_step_interval == 0:
             checkpoint_path = out_dir / f"iter-{state['iter_num']:06d}-ckpt.pth"
