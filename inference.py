@@ -93,27 +93,27 @@ def print_dist(x: torch.Tensor, num):
 def main():
     torch.manual_seed(0)
     model_name = "tiny_LLaMA_1b"
-    checkpoint_path = "/data1/SpikingLlama/168.pth"
-    #checkpoint_path = "out/teacher.pth"
+    #checkpoint_path = "/data1/SpikingLlama/180.pth"
+    checkpoint_path = "out/teacher.pth"
     tokenizer_path = Path("checkpoints/")
     tokenizer = Tokenizer(tokenizer_path)
     config = Config.from_name(model_name)
-    model = QuantGPT(config).to("cuda")
+    model = GPT(config).to("cuda")
     checkpoint = torch.load(checkpoint_path)
     model.load_state_dict(checkpoint, strict=False)
-    hook = Hook()
-    model.transformer.h[0].attn.register_forward_hook(hook.hook_fn)
+    #hook = Hook()
+    #model.transformer.h[0].attn.register_forward_hook(hook.hook_fn)
 
-    input_text = "Hello, I am a freshman and I want to know where I can buy "
-    max_gen_len = 1
+    input_text = "Hello, I am "
+    max_gen_len = 200
     input_tokens = tokenizer.encode(input_text)
     prompt_tokens = input_tokens[:-1]
     out_tokens = generate(model, tokenizer, prompt_tokens, max_gen_len)
     out_text = tokenizer.decode(torch.tensor(out_tokens[0]))
     print(out_text)
     
-    print_dist(hook.output, '168_attn_output')
-    print_dist(hook.input, '168_attn_input')
+    #print_dist(hook.output, '168_attn_output')
+    #print_dist(hook.input, '168_attn_input')
 
 if __name__ == "__main__":
     main()

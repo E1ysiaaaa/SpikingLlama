@@ -38,10 +38,10 @@ out_dir = Path("/data1/SpikingLlama/out") / name
 # Hyperparameters
 GPU_NUM = 6
 num_of_devices = GPU_NUM
-global_batch_size = GPU_NUM * 1 * 1   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
+global_batch_size = GPU_NUM * 4 * 2   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
 learning_rate = 4e-4
-micro_batch_size = 1
-max_step = 80000 * 3
+micro_batch_size = 4
+max_step = 80000 * 2
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
@@ -89,17 +89,17 @@ def setup(
         else:
             strategy = FSDPStrategy(
                 auto_wrap_policy={Block},
-                activation_checkpointing_policy=None,
+                activation_checkpointing_policy={Block},
                 state_dict_type="full",
                 limit_all_gathers=True,
-                sharding_strategy="NO_SHARD",
+                sharding_strategy="FULL_SHARD",
                 cpu_offload=False,
             )
             #strategy = DeepSpeedStrategy()
     else:
         strategy = "auto"
 
-    fabric = L.Fabric(devices=devices, strategy=DDPStrategy(), precision=precision, loggers=[logger, wandb_logger])
+    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=[logger, wandb_logger])
     fabric.print(hparams)
     #fabric.launch(main, train_data_dir, val_data_dir, resume)
     main(fabric, train_data_dir, val_data_dir, resume)

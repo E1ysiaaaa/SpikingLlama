@@ -91,7 +91,7 @@ class ParamHeaveside(nn.Module):
         self.scale = torch.nn.Parameter(torch.ones([size]))
         self.heaveside = act_heaveside(4.0)
 
-    def forward(self, x, infer=False):
+    def forward(self, x, infer=True):
         if not infer:
             if self.normed:
                 shape = x.shape
@@ -109,7 +109,7 @@ class ParamHeaveside(nn.Module):
             return self.heaveside(x, self.scale[:seq_len], self.zero_point[:seq_len])
 
 class QuantGPT(nn.Module):
-    def __init__(self, config: Config, layer=[1, 2]) -> None:
+    def __init__(self, config: Config, layer=range(1, 23)) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
@@ -121,7 +121,7 @@ class QuantGPT(nn.Module):
             if i+1 == layer[-1]:
                 mlist.append(Block(config, quant=True, grad_on=True))
             elif i+1 in layer:
-                mlist.append(Block(config, quant=True))
+                mlist.append(Block(config, quant=True, grad_on=True))
             else:
                 mlist.append(Block(config))
 
@@ -132,14 +132,14 @@ class QuantGPT(nn.Module):
                 ln_f=config.norm_class(config.n_embd, eps=config.norm_eps),
             )
         )
-        #'''
+        '''
         for param in self.transformer.wte.parameters():
             param.requires_grad = False
         for param in self.transformer.ln_f.parameters():
             param.requires_grad = False
         for param in self.lm_head.parameters():
             param.requires_grad = False
-        #'''
+        '''
 
         self.rope_cache: Optional[RoPECache] = None
         self.mask_cache: Optional[torch.Tensor] = None
@@ -238,8 +238,8 @@ class QuantGPT(nn.Module):
         return build_rope_cache(
             seq_len=self.config.block_size,
             n_elem=int(self.config.rotary_percentage * self.config.head_size),
-            dtype=torch.bfloat16,
-            #dtype=idx.dtype,
+            #dtype=torch.bfloat16,
+            dtype=idx.dtype,
             device=idx.device,
             condense_ratio=self.config.condense_ratio,
         )
@@ -343,13 +343,15 @@ class CausalSelfAttention(nn.Module):
         shape = (config.n_head + 2 * config.n_query_groups) * config.head_size
         # key, query, value projections for all heads, but in a batch
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
-
+        #'''
         if self.quant:
             self.encoder1 = ParamHeaveside(config.n_embd)
             #self.encoder1 = QuantReLU()
             self.attn_encoder = ParamHeaveside(config.block_size, normed=True)
             #self.attn_encoder = QuantReLU()
             #self.softmax_encoder = AutoEncoder(config.block_size, config.block_size)
+        #'''
+
         # output projection
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
@@ -366,8 +368,10 @@ class CausalSelfAttention(nn.Module):
     ) -> Tuple[torch.Tensor, Optional[KVCache]]:
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
+        #'''
         if self.quant:
             x = self.encoder1(x)
+        #'''
         qkv = self.attn(x)
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
@@ -470,6 +474,7 @@ class CausalSelfAttention(nn.Module):
         if self.quant:
             attn_weight = attn_weight.transpose(-1, -2)
             attn_weight = self.attn_encoder(attn_weight)
+            #attn_weight = F.relu(attn_weight) / L
             attn_weight = attn_weight.transpose(-2, -1)
             attn_weight = torch.dropout(attn_weight, 0.0, train=True)
             attn_weight = attn_weight * post_mask   # [B, H, S, S]
@@ -507,6 +512,7 @@ class SwiGLU(nn.Module):
     def __init__(self, config: Config, quant=False) -> None:
         super().__init__()
         self.quant = quant
+        #'''
         if self.quant:
             self.encoder1 = ParamHeaveside(config.n_embd)
             #self.encoder1 = QuantReLU()
@@ -516,24 +522,31 @@ class SwiGLU(nn.Module):
             #self.encoder3 = QuantReLU()
             self.encoder4 = ParamHeaveside(config.intermediate_size, normed=True)
             #self.encoder4 = QuantReLU()
+        #'''
         self.w1 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.w2 = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         #self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        #'''
         if self.quant:
             x1 = self.encoder1(x)
             x2 = self.encoder2(x)
         else:
             x1 = x2 = x
+        #'''
+        x1 = x2 = x
         x_fc_1 = self.w1(x1)
         x_fc_2 = self.w2(x2)
+        #'''
         if self.quant:
             x = self.encoder3(x_fc_1) * x_fc_2
         else:
             x = torch.nn.functional.silu(x_fc_1) * x_fc_2
         if self.quant:
             x = self.encoder4(x)
+        #'''
+        x = torch.nn.functional.silu(x_fc_1) * x_fc_2
         y = self.w3(x)
 
         return y
