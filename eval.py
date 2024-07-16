@@ -33,7 +33,7 @@ from lm_eval.__main__ import cli_evaluate
 class SpikeGPTFull(nn.Module):
     def __init__(self, pretrained):
         super().__init__()
-        model_name = "tiny_LLaMA_1b"
+        model_name = "tiny_LLaMA_120M"
         self.config = Config.from_name(model_name)
 
         # Choose the model you want to evaluate.
@@ -43,6 +43,7 @@ class SpikeGPTFull(nn.Module):
         tokenizer_path = Path("checkpoints/")
         self.tokenizer = Tokenizer(tokenizer_path)
 
+    @torch.no_grad()
     def forward(self, x, max_len=None, input_pos=None):
         # Normal GPT generation, no input_pairs or target_pairs
         lm_logits = self.model.forward(x, max_seq_length=max_len, input_pos=input_pos)
@@ -55,7 +56,7 @@ class SpikeLlamaWrapper(HFLM):
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
 
     # change you checkpoint path here (pretrained)
-    def __init__(self, pretrained="/data1/SpikingLlama/out/spiking-llama-1b/iter-036000-ckpt.pth", max_length=512, batch_size=None, device="cuda",
+    def __init__(self, pretrained="out/204.pth", max_length=512, batch_size=None, device="cuda",
                  dtype=torch.float32):
         LM.__init__(self)
         self._model = SpikeGPTFull(pretrained).to(device=device, dtype=dtype)
@@ -65,6 +66,7 @@ class SpikeLlamaWrapper(HFLM):
         self.vocab_size = self.tokenizer.vocab_size
         self.add_bos_token = False
         self.logits_cache = False
+        self.revision = "main"
 
         self._batch_size = int(batch_size) if batch_size is not None else 64
         self._max_length = max_length

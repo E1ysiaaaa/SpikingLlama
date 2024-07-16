@@ -61,9 +61,8 @@ class GPT(nn.Module):
             self.rope_cache = None
             self.mask_cache = None
 
-    @torch.no_grad()
     def forward(
-        self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None, layer = None
+        self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         B, T = idx.size()
         use_kv_cache = input_pos is not None
@@ -102,13 +101,8 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)  # token embeddings of shape (b, t, n_embd)
             
         if not use_kv_cache:
-            if layer is None:
-                for block in self.transformer.h:
-                    x, *_ = block(x, (cos, sin), max_seq_length)
-            else:
-                for k in range(layer):
-                    x, *_ = self.transformer.h[k](x, (cos, sin), max_seq_length)
-                return self.transformer.h[layer-1].pairs
+            for block in self.transformer.h:
+                x, *_ = block(x, (cos, sin), max_seq_length)
 
         else:
             self.kv_caches = self.kv_caches or self.build_kv_caches(x, max_seq_length, cos.size(-1) * 2)
@@ -162,11 +156,9 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(config)
         if not config.shared_attention_norm:
             self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
-        self.mlp = LLaMAMLP(config)
+        self.mlp = GptNeoxMLP(config)
         self.config = config
-        self.pairs = [0, 0]
 
-    @torch.no_grad()
     def forward(
         self,
         x: torch.Tensor,
@@ -179,7 +171,6 @@ class Block(nn.Module):
 
         n_1 = self.norm_1(x)
         h, new_kv_cache = self.attn(n_1, rope, max_seq_length, mask, input_pos, kv_cache)
-        self.pairs[0] = self.attn.pairs
 
         if self.config.parallel_residual:
             n_2 = n_1 if self.config.shared_attention_norm else self.norm_2(x)
@@ -193,7 +184,6 @@ class Block(nn.Module):
             
             x = x + h
             x = x + self.mlp(self.norm_2(x))
-        self.pairs[1] = self.mlp.pairs
         return x, new_kv_cache
 
 
@@ -208,9 +198,6 @@ class CausalSelfAttention(nn.Module):
 
         self.config = config
 
-        self.pairs = [0, 0]
-
-    @torch.no_grad()
     def forward(
         self,
         x: torch.Tensor,
@@ -223,7 +210,6 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         qkv = self.attn(x)
-        self.pairs[0] = x
 
         # assemble into a number of query groups to support MHA, MQA and GQA together (see `config.n_query_groups`)
         q_per_kv = self.config.n_head // self.config.n_query_groups
@@ -280,7 +266,6 @@ class CausalSelfAttention(nn.Module):
 
         # output projection
         out = self.proj(y)
-        self.pairs[1] = out
 
         return out, kv_cache
 
@@ -311,9 +296,8 @@ class CausalSelfAttention(nn.Module):
 
 
 class GptNeoxMLP(nn.Module):
-    def __init__(self, config: Config, i) -> None:
+    def __init__(self, config: Config) -> None:
         super().__init__()
-        self.idx = i
         self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
 
@@ -326,11 +310,9 @@ class LLaMAMLP(nn.Module):
     def __init__(self, config: Config) -> None:
         super().__init__()
         self.swiglu = SwiGLU(config)
-        self.pairs = [0, 0]
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.swiglu(x)
-        self.pairs[0], self.pairs[1] = x, out
         return out
 
 class SwiGLU(nn.Module):
@@ -341,7 +323,6 @@ class SwiGLU(nn.Module):
         self.w3 = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
         #self.swiglu = SwiGLU(config.n_embd,config.intermediate_size, bias=False, _pack_weights=False)
 
-    @torch.no_grad()
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x_fc_1 = self.w1(x)
         x_fc_2 = self.w2(x)

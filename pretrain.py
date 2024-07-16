@@ -27,21 +27,21 @@ from pytorch_lightning.loggers import WandbLogger
 import random
 
 '''
-data stored in /data4/slim_star_combined
-checkpotins stored in /data1/SpikingLlama
+data stored in data/openwebtext_processed
+checkpotins stored in out/spiking-llama-120M
 '''
 
-model_name = "tiny_LLaMA_1b"
-name = "spiking-llama-1b"
-out_dir = Path("/data1/SpikingLlama/out") / name
+model_name = "tiny_LLaMA_120M"
+name = "spike-llama-120M"
+out_dir = Path("out") / name
 
 # Hyperparameters
-GPU_NUM = 6
+GPU_NUM = 4
 num_of_devices = GPU_NUM
-global_batch_size = GPU_NUM * 4 * 2   # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
+global_batch_size = GPU_NUM * 8 * 1  # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
 learning_rate = 4e-4
-micro_batch_size = 4
-max_step = 80000 * 2
+micro_batch_size = 8
+max_step = 80000
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
@@ -73,8 +73,8 @@ wandb_logger = WandbLogger()
 
 def setup(
     devices: int = GPU_NUM,
-    train_data_dir: Path = Path("data/redpajama_sample"),
-    val_data_dir: Optional[Path] = None,
+    train_data_dir: Path = Path("data/openwebtext_processed/train"),
+    val_data_dir: Optional[Path] = Path("data/openwebtext_processed/validation"),
     precision: Optional[str] = None,
     tpu: bool = False,
     resume: Union[bool, Path] = False,
@@ -99,7 +99,7 @@ def setup(
     else:
         strategy = "auto"
 
-    fabric = L.Fabric(devices=devices, strategy=strategy, precision=precision, loggers=[logger, wandb_logger])
+    fabric = L.Fabric(devices=devices, strategy=DDPStrategy(process_group_backend="gloo"), precision=precision, loggers=[logger, wandb_logger])
     fabric.print(hparams)
     #fabric.launch(main, train_data_dir, val_data_dir, resume)
     main(fabric, train_data_dir, val_data_dir, resume)
@@ -136,8 +136,8 @@ def main(fabric, train_data_dir, val_data_dir, resume):
         torch_model = QuantGPT(config)
         torch_model.apply(partial(torch_model._init_weights ,n_layer=config.n_layer))
         #checkpoint = torch.load("/data1/SpikingLlama/163.pth")
-        checkpoint = torch.load("out/teacher.pth")
-        torch_model.load_state_dict(checkpoint, strict=False)
+        #checkpoint = torch.load("out/teacher.pth")
+        #torch_model.load_state_dict(checkpoint, strict=False)
 
     fabric.print(f"Time to instantiate model: {time.perf_counter() - t0:.02f} seconds.")
     fabric.print(f"Total parameters {num_parameters(torch_model):,}")

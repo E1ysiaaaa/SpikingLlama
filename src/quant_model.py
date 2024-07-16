@@ -49,9 +49,9 @@ def act_quantization(b):
     return _uq().apply
 
 class QuantReLU(nn.ReLU):
-    def __init__(self):
+    def __init__(self, bit=15):
         super().__init__()
-        self.bit = 4
+        self.bit = bit
         self.act_alq = act_quantization(self.bit)
         self.act_alpha = torch.nn.Parameter(torch.tensor(8.0))
 
@@ -76,40 +76,87 @@ def act_heaveside(scale):
             y, alpha = ctx.saved_tensors
             alpha_d = 1 / pi * torch.arctan(y) + 1 / 2
             grad_alpha = alpha_d * grad_input
-            arctan_d = 1 / pi * scale / torch.sqrt((scale * y) ** 2 + 1)
+            arctan_d = 1 / pi * scale / ((scale * y) ** 2 + 1)
             grad_beta = -alpha * arctan_d * grad_input
             grad_input = alpha * arctan_d * grad_input
             return grad_input.to(grad_output.dtype), grad_alpha.to(grad_output.dtype), grad_beta.to(grad_output.dtype)
 
     return _uq().apply
 
-class ParamHeaveside(nn.Module):
-    def __init__(self, size, normed=False):
+class SimpleParamHeaveside(nn.Module):
+    def __init__(self, size, token, normed=False):
         super().__init__()
         self.normed = normed
         self.zero_point = torch.nn.Parameter(torch.zeros([size]))
-        self.scale = torch.nn.Parameter(torch.ones([size]))
+        self.embed_scale = torch.nn.Parameter(torch.ones([size]))
+        #A = torch.arange(token)
+        #A = torch.exp(A/token - 1)
+        #self.token_scale = torch.nn.Parameter(A)
+        #self.embed_bias = torch.nn.Parameter(torch.zeros([size]))
+        #self.token_bias = torch.nn.Parameter(torch.zeros([token]))
         self.heaveside = act_heaveside(4.0)
 
-    def forward(self, x, infer=True):
+    def forward(self, x, infer=False):
         if not infer:
             if self.normed:
                 shape = x.shape
                 x = x.flatten(end_dim=-2)
                 x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
                 x = x.reshape(*shape)
-            return self.heaveside(x, self.scale, self.zero_point)
+            x1 = self.heaveside(x, self.embed_scale, self.zero_point)
+            return x1
         else:
             if self.normed:
                 shape = x.shape
                 x = x.flatten(end_dim=-2)
                 x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
                 x = x.reshape(*shape)
-            seq_len = x.shape[-1]
-            return self.heaveside(x, self.scale[:seq_len], self.zero_point[:seq_len])
+            seq_len = x.shape[-2]
+            x1 = self.heaveside(x, self.embed_scale, self.zero_point)
+            return x1
+
+class ParamHeaveside(nn.Module):
+    def __init__(self, size, token, normed=False):
+        super().__init__()
+        self.normed = normed
+        self.zero_point1 = torch.nn.Parameter(torch.zeros([size]))
+        self.zero_point2 = torch.nn.Parameter(torch.rand([size]))
+        #self.zero_point2 = torch.nn.Parameter(torch.ones([size]))
+        self.embed_scale1 = torch.nn.Parameter(torch.ones([size]))
+        self.embed_scale2 = torch.nn.Parameter(torch.rand([size]))
+        #self.embed_scale2 = torch.nn.Parameter(torch.ones([size]))
+        #A = torch.arange(token)
+        #A = torch.exp(A/token - 1)
+        #self.token_scale = torch.nn.Parameter(A)
+        #self.embed_bias = torch.nn.Parameter(torch.zeros([size]))
+        #self.token_bias = torch.nn.Parameter(torch.zeros([token]))
+        self.heaveside = act_heaveside(4.0)
+
+    def forward(self, x, infer=False):
+        if not infer:
+            if self.normed:
+                shape = x.shape
+                x = x.flatten(end_dim=-2)
+                x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
+                x = x.reshape(*shape)
+            x1 = self.heaveside(x, self.embed_scale1, self.zero_point1)
+            x2 = self.heaveside(x, self.embed_scale2, self.zero_point2)
+            return x1 + x2
+            #return self.token_scale.unsqueeze(-1) * (x1 + x2)#+ self.token_bias.unsqueeze(-1) * self.embed_bias
+        else:
+            if self.normed:
+                shape = x.shape
+                x = x.flatten(end_dim=-2)
+                x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
+                x = x.reshape(*shape)
+            seq_len = x.shape[-2]
+            x1 = self.heaveside(x, self.embed_scale1, self.zero_point1)
+            x2 = self.heaveside(x, self.embed_scale2, self.zero_point2)
+            #return self.token_scale[:seq_len].unsqueeze(-1) * (x1 + x2) #+ self.token_bias[:seq_len].unsqueeze(-1) * self.embed_bias
+            return x1 + x2
 
 class QuantGPT(nn.Module):
-    def __init__(self, config: Config, layer=range(1, 23)) -> None:
+    def __init__(self, config: Config, layer=range(1, 13)) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
@@ -238,8 +285,8 @@ class QuantGPT(nn.Module):
         return build_rope_cache(
             seq_len=self.config.block_size,
             n_elem=int(self.config.rotary_percentage * self.config.head_size),
-            #dtype=torch.bfloat16,
-            dtype=idx.dtype,
+            dtype=torch.bfloat16,
+            #dtype=idx.dtype,
             device=idx.device,
             condense_ratio=self.config.condense_ratio,
         )
@@ -275,14 +322,14 @@ class Block(nn.Module):
         else:
             self.norm_1 = MyNorm(config.n_embd, eps=config.norm_eps)
             #self.lora = Lora(config)
-        self.attn = CausalSelfAttention(config, quant)
+        self.attn = CausalSelfAttention(config, quant=True)
         if not config.shared_attention_norm:
             if not quant:
                 self.norm_2 = config.norm_class(config.n_embd, eps=config.norm_eps)
             else:
                 self.norm_2 = MyNorm(config.n_embd, eps=config.norm_eps)
         #self.mlp = config.mlp_class(config)
-        self.mlp = LLaMAMLP(config, quant)
+        self.mlp = GptNeoxMLP(config, quant=True)
         self.config = config
         if not grad_on:
             for param in self.parameters():
@@ -328,7 +375,7 @@ class Lora(nn.Module):
         self.rank = 4
         self.linear1 = nn.Linear(config.n_embd, self.rank, bias=False)
         self.linear2 = nn.Linear(self.rank, config.n_embd, bias=False)
-        self.output = ParamHeaveside(config.n_embd)
+        self.output = ParamHeaveside(config.n_embd, config.block_size)
 
     def forward(self, x):
         out = self.linear1(x)
@@ -345,9 +392,10 @@ class CausalSelfAttention(nn.Module):
         self.attn = nn.Linear(config.n_embd, shape, bias=config.bias)
         #'''
         if self.quant:
-            self.encoder1 = ParamHeaveside(config.n_embd)
+            self.encoder1 = SimpleParamHeaveside(config.n_embd, config.block_size)
+            #self.encoder2 = ParamHeaveside(config.head_size, config.block_size)
             #self.encoder1 = QuantReLU()
-            self.attn_encoder = ParamHeaveside(config.block_size, normed=True)
+            self.attn_encoder = QuantReLU()
             #self.attn_encoder = QuantReLU()
             #self.softmax_encoder = AutoEncoder(config.block_size, config.block_size)
         #'''
@@ -391,8 +439,10 @@ class CausalSelfAttention(nn.Module):
         #     v = v.expand(B, self.config.n_query_groups, q_per_kv, T, self.config.head_size)
 
         q = q.reshape(B,  T, -1, self.config.head_size)  # (B, T, nh_q, hs)
-        k = k.reshape(B,  T, -1, self.config.head_size)  
-        v = v.reshape(B,  T, -1, self.config.head_size)  
+        k = k.reshape(B,  T, -1, self.config.head_size)
+        #v = v.reshape(B, T, -1)
+       # v = self.encoder2(v)
+        v = v.reshape(B, T, -1, self.config.head_size)
 
         cos, sin = rope
 
@@ -450,6 +500,7 @@ class CausalSelfAttention(nn.Module):
         q = q.transpose(1, 2)
         k = k.transpose(1, 2)
         v = v.transpose(1, 2)
+
         if q.size() != k.size():
              k = k.repeat_interleave(q.shape[1]//k.shape[1], dim=1)
              v = v.repeat_interleave(q.shape[1]//v.shape[1], dim=1)
@@ -472,31 +523,41 @@ class CausalSelfAttention(nn.Module):
         attn_weight = q @ k.transpose(-2, -1) * scale_factor
 
         if self.quant:
-            attn_weight = attn_weight.transpose(-1, -2)
-            attn_weight = self.attn_encoder(attn_weight)
+            #attn_weight = attn_weight.transpose(-1, -2)
+            #attn_weight = self.attn_encoder(attn_weight)
+            attn_weight = self.attn_encoder(attn_weight + attn_bias)
             #attn_weight = F.relu(attn_weight) / L
-            attn_weight = attn_weight.transpose(-2, -1)
+            #attn_weight = attn_weight.transpose(-2, -1)
             attn_weight = torch.dropout(attn_weight, 0.0, train=True)
-            attn_weight = attn_weight * post_mask   # [B, H, S, S]
+            #attn_weight = attn_weight * post_mask   # [B, H, S, S]
             y = attn_weight @ v # [B, H, S, D_H]
             return y.transpose(1, 2)
         else:
             attn_weight += attn_bias
-            attn_weight = torch.softmax(attn_weight, dim=-1)
+            attn_weight = F.relu(attn_weight)
             attn_weight = torch.dropout(attn_weight, 0.0, train=True)
             y = attn_weight @ v
             return y.transpose(1, 2)
 
 
 class GptNeoxMLP(nn.Module):
-    def __init__(self, config: Config) -> None:
+    def __init__(self, config: Config, quant=False) -> None:
         super().__init__()
+        self.quant = quant
         self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
+        if quant:
+            self.act2 = ParamHeaveside(config.intermediate_size, config.block_size)
+            self.act1 = ParamHeaveside(config.n_embd, config.block_size)
         self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.quant:
+            x = self.act1(x)
         x = self.fc(x)
-        x = torch.nn.functional.gelu(x)
+        if not self.quant:
+            x = torch.nn.functional.relu(x)
+        else:
+            x = self.act2(x)
         return self.proj(x)
 
 class LLaMAMLP(nn.Module):
