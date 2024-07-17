@@ -96,34 +96,26 @@ class SimpleParamHeaveside(nn.Module):
         #self.token_bias = torch.nn.Parameter(torch.zeros([token]))
         self.heaveside = act_heaveside(4.0)
 
-    def forward(self, x, infer=False):
-        if not infer:
-            if self.normed:
-                shape = x.shape
-                x = x.flatten(end_dim=-2)
-                x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
-                x = x.reshape(*shape)
-            x1 = self.heaveside(x, self.embed_scale, self.zero_point)
-            return x1
-        else:
-            if self.normed:
-                shape = x.shape
-                x = x.flatten(end_dim=-2)
-                x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
-                x = x.reshape(*shape)
-            seq_len = x.shape[-2]
-            x1 = self.heaveside(x, self.embed_scale, self.zero_point)
-            return x1
+    def forward(self, x):
+        if self.normed:
+            shape = x.shape
+            x = x.flatten(end_dim=-2)
+            x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
+            x = x.reshape(*shape)
+        x1 = self.heaveside(x, self.embed_scale, self.zero_point)
+        return x1
 
 class ParamHeaveside(nn.Module):
     def __init__(self, size, token, normed=False):
         super().__init__()
         self.normed = normed
         self.zero_point1 = torch.nn.Parameter(torch.zeros([size]))
-        self.zero_point2 = torch.nn.Parameter(torch.rand([size]))
+        #self.zero_point2 = torch.nn.Parameter(torch.rand([size]))
+        #self.zero_point3 = torch.nn.Parameter(torch.rand([size]))
         #self.zero_point2 = torch.nn.Parameter(torch.ones([size]))
         self.embed_scale1 = torch.nn.Parameter(torch.ones([size]))
-        self.embed_scale2 = torch.nn.Parameter(torch.rand([size]))
+        #self.embed_scale2 = torch.nn.Parameter(torch.rand([size]))
+        #self.embed_scale3 = torch.nn.Parameter(torch.rand([size]))
         #self.embed_scale2 = torch.nn.Parameter(torch.ones([size]))
         #A = torch.arange(token)
         #A = torch.exp(A/token - 1)
@@ -132,28 +124,16 @@ class ParamHeaveside(nn.Module):
         #self.token_bias = torch.nn.Parameter(torch.zeros([token]))
         self.heaveside = act_heaveside(4.0)
 
-    def forward(self, x, infer=False):
-        if not infer:
-            if self.normed:
-                shape = x.shape
-                x = x.flatten(end_dim=-2)
-                x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
-                x = x.reshape(*shape)
-            x1 = self.heaveside(x, self.embed_scale1, self.zero_point1)
-            x2 = self.heaveside(x, self.embed_scale2, self.zero_point2)
-            return x1 + x2
-            #return self.token_scale.unsqueeze(-1) * (x1 + x2)#+ self.token_bias.unsqueeze(-1) * self.embed_bias
-        else:
-            if self.normed:
-                shape = x.shape
-                x = x.flatten(end_dim=-2)
-                x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
-                x = x.reshape(*shape)
-            seq_len = x.shape[-2]
-            x1 = self.heaveside(x, self.embed_scale1, self.zero_point1)
-            x2 = self.heaveside(x, self.embed_scale2, self.zero_point2)
-            #return self.token_scale[:seq_len].unsqueeze(-1) * (x1 + x2) #+ self.token_bias[:seq_len].unsqueeze(-1) * self.embed_bias
-            return x1 + x2
+    def forward(self, x):
+        if self.normed:
+            shape = x.shape
+            x = x.flatten(end_dim=-2)
+            x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
+            x = x.reshape(*shape)
+        x1 = self.heaveside(x, self.embed_scale1, self.zero_point1)
+        #x2 = self.heaveside(x, self.embed_scale2, self.zero_point2)
+        #x3 = self.heaveside(x, self.embed_scale3, self.zero_point3)
+        return x1 #+ x2 + x3
 
 class QuantGPT(nn.Module):
     def __init__(self, config: Config, layer=range(1, 13)) -> None:
@@ -394,6 +374,7 @@ class CausalSelfAttention(nn.Module):
         if self.quant:
             self.encoder1 = SimpleParamHeaveside(config.n_embd, config.block_size)
             #self.encoder2 = ParamHeaveside(config.head_size, config.block_size)
+            self.encoder3 = ParamHeaveside(config.n_embd, config.block_size)
             #self.encoder1 = QuantReLU()
             self.attn_encoder = QuantReLU()
             #self.attn_encoder = QuantReLU()
@@ -441,7 +422,7 @@ class CausalSelfAttention(nn.Module):
         q = q.reshape(B,  T, -1, self.config.head_size)  # (B, T, nh_q, hs)
         k = k.reshape(B,  T, -1, self.config.head_size)
         #v = v.reshape(B, T, -1)
-       # v = self.encoder2(v)
+        #v = self.encoder2(v)
         v = v.reshape(B, T, -1, self.config.head_size)
 
         cos, sin = rope
@@ -478,6 +459,8 @@ class CausalSelfAttention(nn.Module):
         y = y.reshape(B, T, C)  # re-assemble all head outputs side by side
 
         # output projection
+        if self.quant:
+            y = self.encoder3(y)
         y = self.proj(y)
 
         return y, kv_cache
