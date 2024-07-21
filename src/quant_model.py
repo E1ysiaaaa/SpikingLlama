@@ -106,16 +106,15 @@ class SimpleParamHeaveside(nn.Module):
         return x1
 
 class ParamHeaveside(nn.Module):
-    def __init__(self, size, token, normed=False):
+    def __init__(self, size, token):
         super().__init__()
-        self.normed = normed
         self.zero_point1 = torch.nn.Parameter(torch.zeros([size]))
-        #self.zero_point2 = torch.nn.Parameter(torch.rand([size]))
-        #self.zero_point3 = torch.nn.Parameter(torch.rand([size]))
+        self.zero_point2 = torch.nn.Parameter(torch.rand([size]))
+        self.zero_point3 = torch.nn.Parameter(torch.rand([size]))
         #self.zero_point2 = torch.nn.Parameter(torch.ones([size]))
-        self.embed_scale1 = torch.nn.Parameter(torch.ones([size]))
+        self.embed_scale = torch.nn.Parameter(torch.ones([size]))
         #self.embed_scale2 = torch.nn.Parameter(torch.rand([size]))
-        #self.embed_scale3 = torch.nn.Parameter(torch.rand([size]))
+       # self.embed_scale3 = torch.nn.Parameter(torch.rand([size]))
         #self.embed_scale2 = torch.nn.Parameter(torch.ones([size]))
         #A = torch.arange(token)
         #A = torch.exp(A/token - 1)
@@ -125,15 +124,28 @@ class ParamHeaveside(nn.Module):
         self.heaveside = act_heaveside(4.0)
 
     def forward(self, x):
-        if self.normed:
-            shape = x.shape
-            x = x.flatten(end_dim=-2)
-            x = (x - x.mean(dim=0)) / (x.std(dim=0) + 1e-5)
-            x = x.reshape(*shape)
-        x1 = self.heaveside(x, self.embed_scale1, self.zero_point1)
-        #x2 = self.heaveside(x, self.embed_scale2, self.zero_point2)
-        #x3 = self.heaveside(x, self.embed_scale3, self.zero_point3)
-        return x1 #+ x2 + x3
+        x1 = self.heaveside(x, self.embed_scale, self.zero_point1)
+        x2 = self.heaveside(x, self.embed_scale, self.zero_point2)
+        x3 = self.heaveside(x, self.embed_scale, self.zero_point3)
+        return x1 + x2 + x3
+
+    def update(self, step):
+        '''
+        scale = [4, 6, 8, 10, 12]
+        step_num = [10000, 20000, 30000, 40000]
+        if step <= step_num[0]:
+            self.heaveside = act_heaveside(scale[0])
+        elif step <= step_num[1]:
+            self.heaveside = act_heaveside(scale[1])
+        elif step <= step_num[2]:
+            self.heaveside = act_heaveside(scale[2])
+        elif step <= step_num[3]:
+            self.heaveside = act_heaveside(scale[3])
+        else:
+            self.heaveside = act_heaveside(scale[4])
+        '''
+        scale = 4 + 10 / math.pi * math.atan(step / 40000)
+        self.heaveside = act_heaveside(scale)
 
 class QuantGPT(nn.Module):
     def __init__(self, config: Config, layer=range(1, 13)) -> None:
@@ -195,6 +207,10 @@ class QuantGPT(nn.Module):
             # https://github.com/Lightning-AI/lit-gpt/pull/83#issuecomment-1558150179
             self.rope_cache = None
             self.mask_cache = None
+
+    def update(self, step):
+        for layer in self.transformer.h:
+            layer.update(step)
 
     def forward(
         self, idx: torch.Tensor, max_seq_length: Optional[int] = None, input_pos: Optional[torch.Tensor] = None
@@ -314,6 +330,10 @@ class Block(nn.Module):
         if not grad_on:
             for param in self.parameters():
                 param.requires_grad = False
+    
+    def update(self, step):
+        self.attn.update(step)
+        self.mlp.update(step)
 
     def forward(
         self,
@@ -385,6 +405,9 @@ class CausalSelfAttention(nn.Module):
         self.proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
 
         self.config = config
+
+    def update(self, step):
+        self.encoder3.update(step)
 
     def forward(
         self,
@@ -532,6 +555,10 @@ class GptNeoxMLP(nn.Module):
             self.act2 = ParamHeaveside(config.intermediate_size, config.block_size)
             self.act1 = ParamHeaveside(config.n_embd, config.block_size)
         self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
+    
+    def update(self, step):
+        self.act1.update(step)
+        self.act2.update(step)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.quant:

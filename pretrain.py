@@ -41,7 +41,7 @@ num_of_devices = GPU_NUM
 global_batch_size = GPU_NUM * 8 * 1  # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
 learning_rate = 4e-4
 micro_batch_size = 8
-max_step = 80000
+max_step = 80000 * 4
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
@@ -119,14 +119,14 @@ def main(fabric, train_data_dir, val_data_dir, resume):
         fabric=fabric,
         train_data_dir=train_data_dir,
         val_data_dir=val_data_dir,
-        seed=3407,
+        seed=42,
     )
     if val_dataloader is None:
         train_dataloader = fabric.setup_dataloaders(train_dataloader)
     else:
         train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
-    fabric.seed_everything(3407)  # same seed for every process to init model (FSDP)
+    fabric.seed_everything(42)  # same seed for every process to init model (FSDP)
 
     fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.perf_counter()
@@ -143,6 +143,7 @@ def main(fabric, train_data_dir, val_data_dir, resume):
     fabric.print(f"Total parameters {num_parameters(torch_model):,}")
 
     model = fabric.setup(torch_model)
+    #model.mark_forward_method(model.update)
     #abstract_optimizer = torch.optim.AdamW([torch.zeros([1])], lr=learning_rate)
     optimizer = torch.optim.AdamW(
         model.parameters(), lr=learning_rate, weight_decay=weight_decay, betas=(beta1, beta2), foreach=False
@@ -219,6 +220,8 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
         
         # determine and set the learning rate for this iteration
         lr = get_lr(state["iter_num"]) if decay_lr else learning_rate
+        #if state["iter_num"] % 10000 == 0:
+        #    model.update(state["iter_num"])
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
 
