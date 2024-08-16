@@ -31,21 +31,21 @@ data stored in data/openwebtext_processed
 checkpotins stored in out/spiking-llama-120M
 '''
 
-model_name = "tiny_LLaMA_120M"
-name = "spike-llama-120M"
+model_name = "tiny_LLaMA_1b"
+name = "spike-llama-1B"
 out_dir = Path("out") / name
 
 # Hyperparameters
 GPU_NUM = 4
 num_of_devices = GPU_NUM
-global_batch_size = GPU_NUM * 8 * 1  # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
+micro_batch_size = 2
+global_batch_size = GPU_NUM * micro_batch_size * 1  # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
 learning_rate = 4e-4
-micro_batch_size = 8
 max_step = 80000 * 4
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
-save_step_interval = 1000
+save_step_interval = 20000
 eval_step_interval = 1000
 
 
@@ -119,14 +119,14 @@ def main(fabric, train_data_dir, val_data_dir, resume):
         fabric=fabric,
         train_data_dir=train_data_dir,
         val_data_dir=val_data_dir,
-        seed=42,
+        seed=3407,
     )
     if val_dataloader is None:
         train_dataloader = fabric.setup_dataloaders(train_dataloader)
     else:
         train_dataloader, val_dataloader = fabric.setup_dataloaders(train_dataloader, val_dataloader)
 
-    fabric.seed_everything(42)  # same seed for every process to init model (FSDP)
+    fabric.seed_everything(3407)  # same seed for every process to init model (FSDP)
 
     fabric.print(f"Loading model with {config.__dict__}")
     t0 = time.perf_counter()

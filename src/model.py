@@ -18,6 +18,7 @@ from .fused_rotary_embedding import apply_rotary_emb_func
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
+#FlashAttention2Available = False
 
 class GPT(nn.Module):
     def __init__(self, config: Config) -> None:
@@ -121,8 +122,8 @@ class GPT(nn.Module):
         return build_rope_cache(
             seq_len=self.config.block_size,
             n_elem=int(self.config.rotary_percentage * self.config.head_size),
-            #dtype=torch.bfloat16,
-            dtype=idx.dtype,
+            dtype=torch.bfloat16,
+            #dtype=idx.dtype,
             device=idx.device,
             condense_ratio=self.config.condense_ratio,
         )

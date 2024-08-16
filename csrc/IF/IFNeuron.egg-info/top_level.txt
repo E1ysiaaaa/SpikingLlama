@@ -1,2 +1,0 @@
-IFNeuron
-IF_cppcuda

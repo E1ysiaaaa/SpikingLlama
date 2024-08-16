@@ -33,7 +33,7 @@ from lm_eval.__main__ import cli_evaluate
 class SpikeGPTFull(nn.Module):
     def __init__(self, pretrained):
         super().__init__()
-        model_name = "tiny_LLaMA_120M"
+        model_name = "tiny_LLaMA_1b"
         self.config = Config.from_name(model_name)
 
         # Choose the model you want to evaluate.
@@ -56,7 +56,7 @@ class SpikeLlamaWrapper(HFLM):
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
 
     # change you checkpoint path here (pretrained)
-    def __init__(self, pretrained="out/227.pth", max_length=512, batch_size=None, device="cuda",
+    def __init__(self, pretrained="out/252.pth", max_length=512, batch_size=None, device="cuda",
                  dtype=torch.float32):
         LM.__init__(self)
         self._model = SpikeGPTFull(pretrained).to(device=device, dtype=dtype)

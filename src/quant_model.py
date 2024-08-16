@@ -17,9 +17,10 @@ from flash_attn import flash_attn_func
 from src.config import Config
 #from xformers.ops import SwiGLU
 from .fused_rotary_embedding import apply_rotary_emb_func
+from csrc.quant_relu.interface import *
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
-#FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
+FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
 
 def act_quantization(b):
     def uniform_quant(x, b):
@@ -42,22 +43,27 @@ def act_quantization(b):
             grad_input = grad_output.clone()
             x, x_q = ctx.saved_tensors
             i = (x > 1).float()
-            grad_alpha = (grad_output * (i + (x_q - x) * (1 - i))).sum()
+            grad_alpha = (grad_output * (i + (x_q - x)  * (1 - i))).sum()
             grad_input = grad_input * (1 - i)
             return grad_input, grad_alpha
 
     return _uq().apply
 
 class QuantReLU(nn.ReLU):
-    def __init__(self, bit=15):
+    def __init__(self, dim, bit=4):
         super().__init__()
         self.bit = bit
+        self.dim = dim
         self.act_alq = act_quantization(self.bit)
-        self.act_alpha = torch.nn.Parameter(torch.tensor(8.0))
+        self.act_alpha = torch.nn.Parameter(torch.tensor(6.0))
 
     def forward(self, x):
+        '''
         x = F.relu(x)
         return self.act_alq(x, self.act_alpha)
+        '''
+        return quant_relu(x, self.act_alpha.to(x.dtype), self.bit)
+        #'''
 
 def act_heaveside(scale):
     # Surrogate function f(x) = aH(x-b) = 2 / pi * a * arctan((x-b)*scale)
@@ -112,9 +118,9 @@ class ParamHeaveside(nn.Module):
         self.zero_point2 = torch.nn.Parameter(torch.rand([size]))
         self.zero_point3 = torch.nn.Parameter(torch.rand([size]))
         #self.zero_point2 = torch.nn.Parameter(torch.ones([size]))
-        self.embed_scale = torch.nn.Parameter(torch.ones([size]))
-        #self.embed_scale2 = torch.nn.Parameter(torch.rand([size]))
-       # self.embed_scale3 = torch.nn.Parameter(torch.rand([size]))
+        self.embed_scale1 = torch.nn.Parameter(torch.ones([size]))
+        self.embed_scale2 = torch.nn.Parameter(torch.rand([size]))
+        self.embed_scale3 = torch.nn.Parameter(torch.rand([size]))
         #self.embed_scale2 = torch.nn.Parameter(torch.ones([size]))
         #A = torch.arange(token)
         #A = torch.exp(A/token - 1)
@@ -124,9 +130,9 @@ class ParamHeaveside(nn.Module):
         self.heaveside = act_heaveside(4.0)
 
     def forward(self, x):
-        x1 = self.heaveside(x, self.embed_scale, self.zero_point1)
-        x2 = self.heaveside(x, self.embed_scale, self.zero_point2)
-        x3 = self.heaveside(x, self.embed_scale, self.zero_point3)
+        x1 = self.heaveside(x, self.embed_scale1, self.zero_point1)
+        x2 = self.heaveside(x, self.embed_scale2, self.zero_point2)
+        x3 = self.heaveside(x, self.embed_scale3, self.zero_point3)
         return x1 + x2 + x3
 
     def update(self, step):
@@ -144,11 +150,11 @@ class ParamHeaveside(nn.Module):
         else:
             self.heaveside = act_heaveside(scale[4])
         '''
-        scale = 4 + 10 / math.pi * math.atan(step / 40000)
+        scale = 4 + 16 / math.pi * math.atan(step / 40000)
         self.heaveside = act_heaveside(scale)
 
 class QuantGPT(nn.Module):
-    def __init__(self, config: Config, layer=range(1, 13)) -> None:
+    def __init__(self, config: Config, layer=range(1, 23)) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
@@ -394,9 +400,9 @@ class CausalSelfAttention(nn.Module):
         if self.quant:
             self.encoder1 = SimpleParamHeaveside(config.n_embd, config.block_size)
             #self.encoder2 = ParamHeaveside(config.head_size, config.block_size)
-            self.encoder3 = ParamHeaveside(config.n_embd, config.block_size)
-            #self.encoder1 = QuantReLU()
-            self.attn_encoder = QuantReLU()
+            #self.encoder3 = ParamHeaveside(config.n_embd, config.block_size)
+            self.encoder3 = QuantReLU(config.n_embd)
+            self.attn_encoder = QuantReLU(config.block_size)
             #self.attn_encoder = QuantReLU()
             #self.softmax_encoder = AutoEncoder(config.block_size, config.block_size)
         #'''
@@ -552,8 +558,10 @@ class GptNeoxMLP(nn.Module):
         self.quant = quant
         self.fc = nn.Linear(config.n_embd, config.intermediate_size, bias=config.bias)
         if quant:
-            self.act2 = ParamHeaveside(config.intermediate_size, config.block_size)
-            self.act1 = ParamHeaveside(config.n_embd, config.block_size)
+            #self.act2 = ParamHeaveside(config.intermediate_size, config.block_size)
+            self.act2 = QuantReLU(config.intermediate_size)
+            #self.act1 = ParamHeaveside(config.n_embd, config.block_size)
+            self.act1 = QuantReLU(config.n_embd)
         self.proj = nn.Linear(config.intermediate_size, config.n_embd, bias=config.bias)
     
     def update(self, step):
@@ -669,19 +677,20 @@ class MyNorm(nn.Module):
 
     def __init__(self, size: int, dim: int = -1, eps: float = 1e-5) -> None:
         super().__init__()
-        self.weight = torch.nn.Parameter(torch.ones(size))
+        #self.weight = torch.nn.Parameter(torch.ones(size))
         self.eps = eps
         self.dim = dim
         self.size = size
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # NOTE: the original RMSNorm paper implementation is not equivalent
-        norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
-        x_normed = x * torch.rsqrt(norm_x + self.eps)
+       # norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
+        #x_normed = x * torch.rsqrt(norm_x + self.eps)
         #x_normed = x
         #D = self.size
         #return self.weight * x_normed / (D ** 0.5)
-        return self.weight * x_normed
+        #return self.weight * x_normed
+        return x
 
-    def reset_parameters(self):
-        torch.nn.init.ones_(self.weight)
+    #def reset_parameters(self):
+        #torch.nn.init.ones_(self.weight)
