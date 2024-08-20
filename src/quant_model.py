@@ -13,11 +13,11 @@ from math import pi
 from torch import sqrt
 from lightning_utilities.core.imports import RequirementCache
 from typing_extensions import Self
-from flash_attn import flash_attn_func
+#from flash_attn import flash_attn_func
 from src.config import Config
 #from xformers.ops import SwiGLU
 from .fused_rotary_embedding import apply_rotary_emb_func
-from csrc.quant_relu.interface import *
+#from csrc.quant_relu.interface import *
 RoPECache = Tuple[torch.Tensor, torch.Tensor]
 KVCache = Tuple[torch.Tensor, torch.Tensor]
 FlashAttention2Available = RequirementCache("flash-attn>=2.0.0.post1")
@@ -58,12 +58,12 @@ class QuantReLU(nn.ReLU):
         self.act_alpha = torch.nn.Parameter(torch.tensor(6.0))
 
     def forward(self, x):
-        '''
+        #'''
         x = F.relu(x)
         return self.act_alq(x, self.act_alpha)
         '''
         return quant_relu(x, self.act_alpha.to(x.dtype), self.bit)
-        #'''
+        '''
 
 def act_heaveside(scale):
     # Surrogate function f(x) = aH(x-b) = 2 / pi * a * arctan((x-b)*scale)
@@ -154,7 +154,7 @@ class ParamHeaveside(nn.Module):
         self.heaveside = act_heaveside(scale)
 
 class QuantGPT(nn.Module):
-    def __init__(self, config: Config, layer=range(1, 23)) -> None:
+    def __init__(self, config: Config, layer=range(1, 13)) -> None:
         super().__init__()
         assert config.padded_vocab_size is not None
         self.config = config
@@ -287,8 +287,8 @@ class QuantGPT(nn.Module):
         return build_rope_cache(
             seq_len=self.config.block_size,
             n_elem=int(self.config.rotary_percentage * self.config.head_size),
-            dtype=torch.bfloat16,
-            #dtype=idx.dtype,
+            #dtype=torch.bfloat16,
+            dtype=idx.dtype,
             device=idx.device,
             condense_ratio=self.config.condense_ratio,
         )
@@ -677,20 +677,20 @@ class MyNorm(nn.Module):
 
     def __init__(self, size: int, dim: int = -1, eps: float = 1e-5) -> None:
         super().__init__()
-        #self.weight = torch.nn.Parameter(torch.ones(size))
+        self.weight = torch.nn.Parameter(torch.ones(size))
         self.eps = eps
         self.dim = dim
         self.size = size
-
+            
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # NOTE: the original RMSNorm paper implementation is not equivalent
-       # norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
-        #x_normed = x * torch.rsqrt(norm_x + self.eps)
+        norm_x = torch.mean(x * x, dim=self.dim, keepdim=True)
+        x_normed = x * torch.rsqrt(norm_x + self.eps)
         #x_normed = x
         #D = self.size
         #return self.weight * x_normed / (D ** 0.5)
-        #return self.weight * x_normed
-        return x
+        return self.weight * x_normed
+        #return x
 
     #def reset_parameters(self):
         #torch.nn.init.ones_(self.weight)

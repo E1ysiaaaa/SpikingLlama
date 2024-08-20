@@ -14,7 +14,7 @@ from functools import partial
 wd = Path(__file__).parent.parent.resolve()
 sys.path.append(str(wd))
 # from apex.optimizers import FusedAdam #torch optimizer has a cuda backend, which is faster actually
-from src.model import GPT
+#from src.model import GPT
 from src.quant_model import QuantGPT, Block, Config, CausalSelfAttention
 from src.packed_dataset import CombinedDataset, PackedDataset
 from src.speed_monitor import SpeedMonitorFabric as Monitor
@@ -31,21 +31,21 @@ data stored in data/openwebtext_processed
 checkpotins stored in out/spiking-llama-120M
 '''
 
-model_name = "tiny_LLaMA_1b"
-name = "spike-llama-1B"
+model_name = "tiny_LLaMA_120M"
+name = "spike-llama-120M"
 out_dir = Path("out") / name
 
 # Hyperparameters
 GPU_NUM = 4
 num_of_devices = GPU_NUM
-micro_batch_size = 2
+micro_batch_size = 10
 global_batch_size = GPU_NUM * micro_batch_size * 1  # global_batch_size = GPU_NUM * micro_batch_size * gradient_accumulation_steps
 learning_rate = 4e-4
-max_step = 80000 * 4
+max_step = 80000 * 16
 warmup_steps = 2000
 log_step_interval = 10
 eval_iters = 100
-save_step_interval = 20000
+save_step_interval = 10000
 eval_step_interval = 1000
 
 
@@ -179,7 +179,7 @@ def train(fabric, state, train_dataloader, val_dataloader, monitor, resume):
         validate(fabric, model, val_dataloader)  # sanity check
 
     with torch.device("meta"):
-        meta_model = GPT(model.config)
+        meta_model = QuantGPT(model.config)
         # "estimated" is not as precise as "measured". Estimated is optimistic but widely used in the wild.
         # When comparing MFU or FLOP numbers with other projects that use estimated FLOPs,
         # consider passing `SpeedMonitor(flops_per_batch=estimated_flops)` instead

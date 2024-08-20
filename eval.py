@@ -1,5 +1,5 @@
-from src.model import GPT
-from src.spike_model import SpikeGPT, IF, SpikeInnerProduct
+#from src.model import GPT
+#from src.spike_model import SpikeGPT, IF, SpikeInnerProduct
 from src.quant_model import QuantGPT
 from src.config import Config
 from src.tokenizer import Tokenizer
@@ -33,7 +33,7 @@ from lm_eval.__main__ import cli_evaluate
 class SpikeGPTFull(nn.Module):
     def __init__(self, pretrained):
         super().__init__()
-        model_name = "tiny_LLaMA_1b"
+        model_name = "tiny_LLaMA_120M"
         self.config = Config.from_name(model_name)
 
         # Choose the model you want to evaluate.
@@ -56,7 +56,7 @@ class SpikeLlamaWrapper(HFLM):
     AUTO_MODEL_CLASS = transformers.AutoModelForCausalLM
 
     # change you checkpoint path here (pretrained)
-    def __init__(self, pretrained="out/252.pth", max_length=512, batch_size=None, device="cuda",
+    def __init__(self, pretrained="out/spike-llama-120M/iter-280000-ckpt.pth", max_length=512, batch_size=None, device="cuda",
                  dtype=torch.float32):
         LM.__init__(self)
         self._model = SpikeGPTFull(pretrained).to(device=device, dtype=dtype)
@@ -67,6 +67,9 @@ class SpikeLlamaWrapper(HFLM):
         self.add_bos_token = False
         self.logits_cache = False
         self.revision = "main"
+        self.peft = None
+        self.delta = None
+        self.pretrained = None
 
         self._batch_size = int(batch_size) if batch_size is not None else 64
         self._max_length = max_length
