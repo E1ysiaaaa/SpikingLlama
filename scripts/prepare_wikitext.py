@@ -40,21 +40,10 @@ def prepare(
     all_set = load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1")
     train_set = list(all_set["train"])
     val_set = list(all_set["validation"])
-    #dataset = dataset[:int(len(dataset) * percentage)]
-    num_processes = cpu_count()
     #print(dataset[0])
-    chunked_dataset = np.array_split(val_set, num_processes)
-    processes = []
     print("start")
 
-    for i, subset in enumerate(chunked_dataset):
-        p = Process(target=prepare_full, args=(tokenizer_path, destination_path, chunk_size, "validation", list(subset), i))
-        processes.append(p)
-        p.start()
-
-    for p in processes:
-        p.join()
-
+    prepare_full(tokenizer_path, destination_path, chunk_size, "train", train_set)
     print("finished")
 
 if __name__ == "__main__":
