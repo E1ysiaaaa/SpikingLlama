@@ -5,7 +5,7 @@ This repository aims to use a fully connected network and a QCFS neuron to imple
 To run the script, please first configure the python environment using the following scipts.
 
 	conda create -n SpikingLlama python==3.11
-	pip3 install -r requirements
+	pip3 install -r requirements.txt
 
 We also need the rotatory embedding and the fused entropy script from flash attention. To install the module, run the following scripts.
 
